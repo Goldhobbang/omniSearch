@@ -34,7 +34,7 @@ try:
 except ImportError:
     from duckduckgo_search import DDGS
 
-TOOL_VERSION = 7
+TOOL_VERSION = 8
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DB = os.environ.get("OMNI_CACHE") or os.path.join(
     os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME")
@@ -64,16 +64,17 @@ TECH_HINTS = ("양자", "초전도", "데이터베이스", "학습", "칩", "프
               "아키텍처", "알고리즘", "네트워크", "반도체", "protein", "quantum")
 
 CHAIN = {
-    "기관명": ["wikipedia", "searxng", "duckduckgo", "you_search", "wikidata"],
+    "기관명": ["wikipedia", "searxng", "wikidata", "duckduckgo", "you_search"],
     "기술용어": ["wikipedia", "searxng", "duckduckgo", "you_search"],
-    "entity": ["wikipedia", "searxng", "duckduckgo", "you_search", "wikidata"],
+    "entity": ["wikipedia", "searxng", "wikidata", "duckduckgo", "you_search"],
     "general": ["wikipedia", "searxng", "duckduckgo", "you_search"],
-    "한국어 신조어": ["searxng", "duckduckgo", "you_search", "wikipedia"],
-    "논문 제목": ["openalex", "semantic_scholar", "arxiv", "crossref",
-              "wikipedia", "duckduckgo", "you_search"],
-    "최신 AI뉴스나 논란": ["duckduckgo_news", "wikipedia", "you_search",
-                        "gdelt", "duckduckgo"],
+    "한국어 신조어": ["searxng", "wikipedia", "duckduckgo", "you_search"],
+    "논문 제목": ["openalex", "crossref", "arxiv", "wikipedia", "searxng",
+              "duckduckgo", "you_search"],
+    "최신 AI뉴스나 논란": ["searxng_news", "wikipedia", "duckduckgo_news",
+                        "you_search"],
 }
+# gdelt / semantic_scholar: 키 없는 공유 한도라 실측 429 대부분 -> extra= 로만 사용.
 # marginalia는 기본 체인에서 제외 (공유키 429 상시 + 범용품질 낮음).
 # 영어 롱테일/인디웹 전용 opt-in: extra=["marginalia"] 또는 OMNI_EXTRA 환경변수.
 
@@ -287,13 +288,23 @@ _POLITE_LOCK = threading.Lock()
 # 기본은 fail-fast: 429/차단이면 대기하지 않고 엔진을 COOLDOWN초 쉬게 한 뒤 즉시 포기.
 # 대량 배치(eval/verify.py)는 OMNI_PATIENT=1 로 기존 대기·재시도 동작 사용.
 PATIENT = os.environ.get("OMNI_PATIENT") == "1"
-DEADLINE = float(os.environ.get("OMNI_DEADLINE", "600" if PATIENT else "8"))  # 검색 1회 전체 대기 상한(초)
+DEADLINE = float(os.environ.get("OMNI_DEADLINE", "600" if PATIENT else "4"))  # 검색 1회 전체 대기 상한(초)
 COOLDOWN = 30
 _COOL_UNTIL = {}
 
 
+_STRIKES = {}
+
+
 def _cool(label, seconds=COOLDOWN):
-    _COOL_UNTIL[label] = time.time() + seconds
+    """연속 차단마다 쉬는 시간 2배 (최대 10분). 성공하면 _ok()가 초기화."""
+    n = _STRIKES.get(label, 0)
+    _STRIKES[label] = n + 1
+    _COOL_UNTIL[label] = time.time() + min(600, seconds * 2 ** n)
+
+
+def _ok(label):
+    _STRIKES.pop(label, None)
 
 
 def _check_cool(label):
@@ -302,12 +313,17 @@ def _check_cool(label):
 
 
 def _polite(key, min_interval):
+    """엔진별 호출 간격. 잠금 안에서는 슬롯만 예약하고 대기는 밖에서 -> 엔진끼리 안 막힘.
+    fail-fast 모드에서 대기열이 DEADLINE보다 길면 기다리지 않고 건너뜀."""
     with _POLITE_LOCK:
         now = time.time()
-        wait = min_interval - (now - _LAST_CALL.get(key, 0))
-        if wait > 0:
-            time.sleep(wait)
-        _LAST_CALL[key] = time.time()
+        slot = max(now, _LAST_CALL.get(key, 0) + min_interval)
+        wait = slot - now
+        if not PATIENT and wait > DEADLINE:
+            raise ToolUnavailable(f"{key}: busy (queue {wait:.1f}s)")
+        _LAST_CALL[key] = slot
+    if wait > 0:
+        time.sleep(wait)
 
 
 def _backoff_seconds(resp, attempt):
@@ -346,7 +362,9 @@ def _get_json(url, params, timeout, label, min_interval=0.8, tries=4):
         except requests.RequestException as e:
             raise ToolUnavailable(f"{label}: {e}")
         try:
-            return r.json()
+            data = r.json()
+            _ok(label)
+            return data
         except ValueError:
             time.sleep(2 * (i + 1))  # 빈 응답 등 일시 오류 -> 재시도
             if i == tries - 1:
@@ -429,9 +447,10 @@ def _ddg_once(kind, query, max_results):
     _polite("ddg", 3.0)
     ddgs = DDGS()
     try:
+        # backend 명시: 기본 "auto"는 여러 엔진을 2개씩 순차로 도는 메타검색이라 10초+.
         if kind == "text":
-            return list(ddgs.text(query, max_results=max_results))
-        return list(ddgs.news(query, max_results=max_results))
+            return list(ddgs.text(query, max_results=max_results, backend="duckduckgo"))
+        return list(ddgs.news(query, max_results=max_results, backend="duckduckgo"))
     finally:
         try:
             ddgs.__exit__(None, None, None)
@@ -464,6 +483,7 @@ def _ddg_guarded(kind, query, max_results, norm_fn):
         junk = looks_junk(query, out)
         if (sc > 0 and not junk) or len(out) < 3 or attempt == 1:
             _DDG_FAILS[0] = 0
+            _ok("ddg")
             return out, sc
         last = "junk-results-softblock"
         _DDG_FAILS[0] += 1
@@ -560,9 +580,13 @@ def _searxng_autostart(base):
         return False
 
 
-def searxng_search(query, max_results=8):
+def searxng_news(query, max_results=8):
+    return searxng_search(query, max_results, category="news")
+
+
+def searxng_search(query, max_results=8, category="general"):
     """로컬 SearXNG (searxng/start.sh). 꺼져 있으면 자동 실행 1회 시도."""
-    key = f"v{TOOL_VERSION}:searxng:{query}:{max_results}"
+    key = f"v{TOOL_VERSION}:searxng:{category}:{query}:{max_results}"
     c = cache_get(key)
     if c is not None:
         return c
@@ -570,7 +594,8 @@ def searxng_search(query, max_results=8):
     for attempt in range(2):
         try:
             r = _session.get(f"{base}/search",
-                             params={"q": query, "format": "json"}, timeout=(2, 15))
+                             params={"q": query, "format": "json",
+                                     "categories": category}, timeout=(2, 15))
             r.raise_for_status()
             data = r.json()
             break
@@ -616,11 +641,18 @@ def arxiv_search(query, max_results=8):
     c = cache_get(key)
     if c is not None:
         return c
+    # 문장부호("BERT:")가 섞이면 0건 -> 영숫자 토큰만, 제목 필드 AND 검색
+    toks = [t for t in re.findall(r"[A-Za-z0-9]+", query) if t.lower() not in EN_STOP]
+    if not toks:
+        return []
+    _check_cool("arxiv")
     _polite("arxiv", 3.0)
     try:
         r = _session.get("https://export.arxiv.org/api/query", params={
-            "search_query": " AND ".join(f"all:{t}" for t in query.split()), "max_results": max_results},
-            timeout=20)
+            "search_query": " AND ".join(f"ti:{t}" for t in toks),
+            "max_results": max_results}, timeout=20)
+        if r.status_code in (429, 503):
+            _cool("arxiv")
         r.raise_for_status()
         root = ET.fromstring(r.content)
     except (requests.RequestException, ET.ParseError) as e:
@@ -757,6 +789,7 @@ ENGINES = {
     "marginalia": marginalia_search,
     "you_search": you_search,
     "searxng": searxng_search,
+    "searxng_news": searxng_news,
     "semantic_scholar": semantic_scholar_search,
     "arxiv": arxiv_search,
     "crossref": crossref_search,
@@ -817,6 +850,7 @@ TOOL_LABELS = {
     "marginalia": "Marginalia 독립엔진 (키 불필요)",
     "you_search": "You.com keyless (키 불필요)",
     "searxng": "SearXNG 로컬 메타검색 (키 불필요)",
+    "searxng_news": "SearXNG 뉴스 (키 불필요)",
     "semantic_scholar": "Semantic Scholar 논문 (키 불필요)",
     "arxiv": "arXiv 논문 (키 불필요)",
     "crossref": "Crossref 논문 (키 불필요)",
@@ -824,7 +858,8 @@ TOOL_LABELS = {
 }
 
 
-LAZY_ENGINES = {"you_search"}  # 일일 한도 있음 -> search()에서 선제 호출 안 함
+# search()에서 차례가 와야 호출: you_search는 일일 한도, ddg는 차단이 잦은 예비 엔진.
+LAZY_ENGINES = {"you_search", "duckduckgo", "duckduckgo_news"}
 
 
 def _run_one(tool, q):
@@ -894,8 +929,11 @@ def search(query, curated=None, extra=None):
         call = lambda t: [x for x in ENGINES[t](q) if norm(x.get("title"))]
         futs = {t: ex.submit(call, t) for t in chain if t not in LAZY_ENGINES}
         end = time.time() + DEADLINE
-        for tool in chain:
-            fu = futs.get(tool) or ex.submit(call, tool)
+        for i, tool in enumerate(chain):
+            if tool not in futs:  # 예비 엔진 차례 = 앞 엔진 전부 불합격 -> 남은 예비 동시 시작
+                for t in chain[i:]:
+                    futs.setdefault(t, ex.submit(call, t))
+            fu = futs[tool]
             try:
                 items = fu.result(timeout=max(0.1, end - time.time()))
             except FutureTimeout:

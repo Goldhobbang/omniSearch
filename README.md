@@ -68,12 +68,12 @@ API: `GET /api/smart-search?q=...`, `GET /api/search?q=...&type=text|images|news
 | Engine | Use | Note |
 |---|---|---|
 | Wikipedia (ko/en) | entities, orgs, tech | official API |
-| SearXNG (local) | general web + Naver | auto-installed/started on first use, see below |
-| DuckDuckGo text/news (`ddgs`) | general, slang, news | anti-bot hardening included |
-| You.com keyless MCP | general web | ~100/day |
-| OpenAlex, Semantic Scholar, arXiv, Crossref | paper titles | S2 keyless pool often 429 |
-| GDELT DOC | news | public endpoint |
+| SearXNG (local) | general web + Naver, news (primary) | auto-installed/started on first use, see below |
+| OpenAlex, Crossref, arXiv | paper titles | arXiv: title-field search, 3s spacing |
 | Wikidata | entity senses (label + description) | disambiguation |
+| DuckDuckGo text/news (`ddgs`, backend `duckduckgo`) | fallback | called only when earlier engines fail |
+| You.com keyless MCP | fallback | ~100/day, called only when reached |
+| GDELT DOC, Semantic Scholar | news / papers (opt-in `extra=`) | keyless shared pools, mostly 429 in tests |
 | Marginalia | English indie web (opt-in) | shared key, usually 429 |
 
 ### SearXNG
@@ -94,8 +94,16 @@ Manual start: `wsl -e bash src/omnisearch/searxng/start.sh` (Windows) / `bash sr
 | `CROSSREF_MAILTO` | — | contact email for Crossref polite pool |
 | `MARGINALIA_KEY` | `public` | dedicated free key |
 | `OMNI_PORT` | `5000` | web UI port |
-| `OMNI_DEADLINE` | `8` | max seconds one search waits; slow engines finish in background and fill the cache |
+| `OMNI_DEADLINE` | `4` | max seconds one search waits; slow engines finish in background and fill the cache |
 | `OMNI_PATIENT` | `0` | `1` = wait/retry on rate limits instead of fail-fast cooldown (set by `eval/verify.py`) |
+
+## Speed and rate limits
+
+- `search()` starts the non-fallback engines of a chain at once and returns the first result that
+  passes, in priority order; slow engines finish in the background and fill the cache.
+- per-engine call spacing reserves a slot and sleeps outside the lock, so one engine's wait never
+  blocks another; a queue longer than the deadline is skipped instead of waited on.
+- 429 / soft block: the engine cools down 30s, doubling on each repeat (max 10 min), reset on success.
 
 ## Anti-junk design
 
@@ -107,6 +115,10 @@ Manual start: `wsl -e bash src/omnisearch/searxng/start.sh` (Windows) / `bash sr
 
 ```bash
 python tests/test_junk.py                     # offline unit tests (CI)
+python tests/test_ratelimit.py
+python eval/bench.py run paced 0              # latency/quality under human pacing
+python eval/bench.py run burst 1              # ... under back-to-back agent pacing
+python eval/bench.py report eval/bench_out/*.json
 python eval/spot.py                           # live spot check -> eval/spot.txt
 python eval/verify.py --start 0 --count 100   # 1000-word harness, resumable
 python eval/build_words.py                    # rebuild eval/words_1000.json

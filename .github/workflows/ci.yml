@@ -13,4 +13,5 @@ jobs:
           python-version: "3.12"
       - run: pip install -e ".[web,mcp]"
       - run: python tests/test_junk.py
+      - run: python tests/test_ratelimit.py
       - run: python -c "import omnisearch.web, omnisearch.mcp_server, omnisearch.cli"

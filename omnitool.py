@@ -22,6 +22,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+import xml.etree.ElementTree as ET
 
 import requests
 try:
@@ -29,7 +30,7 @@ try:
 except ImportError:
     from duckduckgo_search import DDGS
 
-TOOL_VERSION = 6
+TOOL_VERSION = 7
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DB = os.path.join(BASE_DIR, "omnitool_cache.db")
 CACHE_TTL = 7 * 86400
@@ -56,12 +57,13 @@ TECH_HINTS = ("양자", "초전도", "데이터베이스", "학습", "칩", "프
               "아키텍처", "알고리즘", "네트워크", "반도체", "protein", "quantum")
 
 CHAIN = {
-    "기관명": ["wikipedia", "duckduckgo", "you_search"],
+    "기관명": ["wikipedia", "duckduckgo", "you_search", "wikidata"],
     "기술용어": ["wikipedia", "duckduckgo", "you_search"],
-    "entity": ["wikipedia", "duckduckgo", "you_search"],
+    "entity": ["wikipedia", "duckduckgo", "you_search", "wikidata"],
     "general": ["wikipedia", "duckduckgo", "you_search"],
     "한국어 신조어": ["duckduckgo", "you_search", "wikipedia"],
-    "논문 제목": ["openalex", "wikipedia", "duckduckgo", "you_search"],
+    "논문 제목": ["openalex", "semantic_scholar", "arxiv", "crossref",
+              "wikipedia", "duckduckgo", "you_search"],
     "최신 AI뉴스나 논란": ["duckduckgo_news", "wikipedia", "you_search",
                         "gdelt", "duckduckgo"],
 }
@@ -306,9 +308,9 @@ def _get_json(url, params, timeout, label, min_interval=0.8, tries=4):
                 raise ToolUnavailable(f"{label}: net {e}")
             continue
         if r.status_code == 429:
-            time.sleep(_backoff_seconds(r, i))
-            if i == tries - 1:
+            if i == tries - 1:  # 마지막 시도면 대기 없이 바로 포기
                 raise ToolUnavailable(f"{label}: 429 persistent")
+            time.sleep(_backoff_seconds(r, i))
             continue
         try:
             r.raise_for_status()
@@ -488,6 +490,95 @@ def marginalia_search(query, max_results=8):
     return out
 
 
+def semantic_scholar_search(query, max_results=8):
+    """Semantic Scholar. 키 없으면 공유 한도라 429 잦음 -> tries=2로 빨리 포기."""
+    key = f"v{TOOL_VERSION}:s2:{query}:{max_results}"
+    c = cache_get(key)
+    if c is not None:
+        return c
+    data = _get_json("https://api.semanticscholar.org/graph/v1/paper/search", {
+        "query": query, "limit": max_results,
+        "fields": "title,url,year,citationCount,authors",
+    }, 15, "semantic_scholar", min_interval=1.1, tries=2)
+    out = []
+    for p in data.get("data") or []:
+        authors = ", ".join(a.get("name", "") for a in (p.get("authors") or [])[:3])
+        out.append({"title": p.get("title") or "", "url": p.get("url") or "",
+                    "snippet": f"{p.get('year') or '?'}년 · 인용 "
+                               f"{p.get('citationCount') or 0}회 · {authors}"})
+    cache_put(key, out)
+    return out
+
+
+_ATOM = "{http://www.w3.org/2005/Atom}"
+
+
+def arxiv_search(query, max_results=8):
+    """arXiv Atom API. 이용 규칙상 호출 간격 3초."""
+    key = f"v{TOOL_VERSION}:arxiv:{query}:{max_results}"
+    c = cache_get(key)
+    if c is not None:
+        return c
+    _polite("arxiv", 3.0)
+    try:
+        r = _session.get("https://export.arxiv.org/api/query", params={
+            "search_query": f'all:"{query}"', "max_results": max_results},
+            timeout=20)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+    except (requests.RequestException, ET.ParseError) as e:
+        raise ToolUnavailable(f"arxiv: {e}")
+    out = []
+    for e in root.findall(f"{_ATOM}entry"):
+        out.append({"title": norm(e.findtext(f"{_ATOM}title") or ""),
+                    "url": e.findtext(f"{_ATOM}id") or "",
+                    "snippet": (e.findtext(f"{_ATOM}published") or "")[:4] + "년 · "
+                               + norm(e.findtext(f"{_ATOM}summary") or "")[:200]})
+    cache_put(key, out)
+    return out
+
+
+def crossref_search(query, max_results=8):
+    """Crossref. CROSSREF_MAILTO 환경변수 있으면 polite pool 사용."""
+    key = f"v{TOOL_VERSION}:crossref:{query}:{max_results}"
+    c = cache_get(key)
+    if c is not None:
+        return c
+    params = {"query.bibliographic": query, "rows": max_results,
+              "select": "title,DOI,URL,issued,is-referenced-by-count"}
+    if os.environ.get("CROSSREF_MAILTO"):
+        params["mailto"] = os.environ["CROSSREF_MAILTO"]
+    data = _get_json("https://api.crossref.org/works", params, 20, "crossref")
+    out = []
+    for w in data.get("message", {}).get("items", []):
+        year = ((w.get("issued") or {}).get("date-parts") or [[None]])[0][0]
+        out.append({"title": " ".join(w.get("title") or []),
+                    "url": w.get("URL") or "",
+                    "snippet": f"{year or '?'}년 · 인용 "
+                               f"{w.get('is-referenced-by-count', 0)}회"})
+    cache_put(key, out)
+    return out
+
+
+def wikidata_search(query, max_results=8):
+    """Wikidata 개체 후보 (동명이의 구분용: 라벨 + 설명)."""
+    key = f"v{TOOL_VERSION}:wikidata:{query}:{max_results}"
+    c = cache_get(key)
+    if c is not None:
+        return c
+    lang = "ko" if has_hangul(query) else "en"
+    data = _get_json("https://www.wikidata.org/w/api.php", {
+        "action": "wbsearchentities", "search": query, "language": lang,
+        "uselang": lang, "limit": max_results, "format": "json",
+    }, 15, "wikidata")
+    out = [{"title": e.get("label", ""),
+            "url": "https://www.wikidata.org/wiki/" + e.get("id", ""),
+            "snippet": e.get("description", "")}
+           for e in data.get("search", [])]
+    cache_put(key, out)
+    return out
+
+
 def _parse_mcp_sse(text):
     """You.com MCP SSE에서 you-search 결과 추출 -> 표준 items."""
     for m in re.finditer(r"^data: (.*)$", text, re.M):
@@ -568,6 +659,10 @@ ENGINES = {
     "duckduckgo_news": ddg_news,
     "marginalia": marginalia_search,
     "you_search": you_search,
+    "semantic_scholar": semantic_scholar_search,
+    "arxiv": arxiv_search,
+    "crossref": crossref_search,
+    "wikidata": wikidata_search,
 }
 
 
@@ -623,6 +718,10 @@ TOOL_LABELS = {
     "duckduckgo_news": "DuckDuckGo 뉴스 (키 불필요)",
     "marginalia": "Marginalia 독립엔진 (키 불필요)",
     "you_search": "You.com keyless (키 불필요)",
+    "semantic_scholar": "Semantic Scholar 논문 (키 불필요)",
+    "arxiv": "arXiv 논문 (키 불필요)",
+    "crossref": "Crossref 논문 (키 불필요)",
+    "wikidata": "Wikidata 개체 (키 불필요)",
 }
 
 

@@ -6,3 +6,4 @@ __pycache__/
 verify_progress.json
 probe_out.txt
 exp_out.jsonl
+spot.txt

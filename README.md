@@ -10,7 +10,7 @@ API키 없이 첫 검색에 최고품질을 주는 자립형 검색 라우터. �
 | OpenAlex | paper titles | official API |
 | GDELT DOC | news | public endpoint |
 | DuckDuckGo text/news (`ddgs`) | general, slang, news | anti-bot hardening included |
-| Marginalia (`public` key) | indie/long-tail web | shared limit, last resort |
+| Marginalia (`public` key) | English long-tail / indie web only (opt-in) | shared limit, usually 429 |
 | You.com keyless MCP (`?profile=free`) | general web | ~100/day, no signup |
 
 ## Quickstart
@@ -31,6 +31,19 @@ Library use:
 from omnitool import search, multi_search
 r = search("Attention Is All You Need")   # best-pick, never raises
 m = multi_search("StayFree")              # every engine, scored, sense-separated
+m2 = multi_search("reciprocal rank fusion", extra=["marginalia"])  # opt-in niche engine
+```
+
+Marginalia: excluded from default chains (shared `public` key is rate-limited;
+quality is English-indie-only). Enable globally with `OMNI_EXTRA=marginalia`.
+Dedicated free key via `MARGINALIA_KEY` env.
+
+## Tests
+
+```powershell
+python tests/test_junk.py   # offline unit tests
+python spot.py              # live spot check -> spot.txt
+python verify.py --start 0 --count 100   # 1000-word harness
 ```
 
 ## API

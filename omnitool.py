@@ -24,7 +24,10 @@ import unicodedata
 import urllib.parse
 
 import requests
-from duckduckgo_search import DDGS
+try:
+    from ddgs import DDGS
+except ImportError:
+    from duckduckgo_search import DDGS
 
 TOOL_VERSION = 6
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,15 +56,27 @@ TECH_HINTS = ("양자", "초전도", "데이터베이스", "학습", "칩", "프
               "아키텍처", "알고리즘", "네트워크", "반도체", "protein", "quantum")
 
 CHAIN = {
-    "기관명": ["wikipedia", "duckduckgo", "you_search", "marginalia"],
-    "기술용어": ["wikipedia", "duckduckgo", "you_search", "marginalia"],
-    "entity": ["wikipedia", "duckduckgo", "you_search", "marginalia"],
-    "general": ["wikipedia", "duckduckgo", "you_search", "marginalia"],
-    "한국어 신조어": ["duckduckgo", "you_search", "wikipedia", "marginalia"],
+    "기관명": ["wikipedia", "duckduckgo", "you_search"],
+    "기술용어": ["wikipedia", "duckduckgo", "you_search"],
+    "entity": ["wikipedia", "duckduckgo", "you_search"],
+    "general": ["wikipedia", "duckduckgo", "you_search"],
+    "한국어 신조어": ["duckduckgo", "you_search", "wikipedia"],
     "논문 제목": ["openalex", "wikipedia", "duckduckgo", "you_search"],
     "최신 AI뉴스나 논란": ["duckduckgo_news", "wikipedia", "you_search",
                         "gdelt", "duckduckgo"],
 }
+# marginalia는 기본 체인에서 제외 (공유키 429 상시 + 범용품질 낮음).
+# 영어 롱테일/인디웹 전용 opt-in: extra=["marginalia"] 또는 OMNI_EXTRA 환경변수.
+
+def _with_extra(chain, extra):
+    if extra is None:
+        extra = [e.strip() for e in os.environ.get("OMNI_EXTRA", "").split(",")
+                 if e.strip()]
+    out = list(chain)
+    for e in extra:
+        if e in ENGINES and e not in out:
+            out.append(e)
+    return out
 
 
 class ToolUnavailable(Exception):
@@ -448,14 +463,17 @@ def ddg_news(query, max_results=8):
 
 
 def marginalia_search(query, max_results=8):
+    """Marginalia 독립엔진. 키는 MARGINALIA_KEY 환경변수, 기본값은 공유키 public.
+    전용키(무료 비상업)는 contact@marginalia-search.com 이메일로 발급."""
     key = f"v{TOOL_VERSION}:marg:{query}:{max_results}"
     c = cache_get(key)
     if c is not None:
         return c
+    api_key = os.environ.get("MARGINALIA_KEY", "public")
     try:
         r = _session.get("https://api2.marginalia-search.com/search",
                          params={"query": query, "count": max_results},
-                         headers={"API-Key": "public"}, timeout=12)
+                         headers={"API-Key": api_key}, timeout=12)
         if r.status_code in (429, 503):
             raise ToolUnavailable("marginalia: shared-key rate limited")
         r.raise_for_status()
@@ -625,7 +643,7 @@ def _run_one(tool, q):
                       "status": "error", "detail": str(e)[:120]}
 
 
-def multi_search(query, curated=None):
+def multi_search(query, curated=None, extra=None):
     """체인 내 전 엔진 실행 + 점수순 정렬. 절대 raise하지 않음.
     단일 best만 보던 search()와 달리 모든 sense를 보여줘서
     동명이의(StayFree 노래 vs 앱 같은) 케이스를 사용자가 직접 고를 수 있다."""
@@ -636,9 +654,7 @@ def multi_search(query, curated=None):
     try:
         route = classify(q, curated)
         cat = route["category"]
-        chain = list(CHAIN.get(cat, CHAIN["general"]))
-        if "marginalia" not in chain:
-            chain = chain + ["marginalia"]
+        chain = _with_extra(CHAIN.get(cat, CHAIN["general"]), extra)
         tools = {}
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=len(chain)) as ex:
@@ -654,7 +670,7 @@ def multi_search(query, curated=None):
                 "error": f"fatal: {e}", "tools": {}}
 
 
-def search(query, curated=None):
+def search(query, curated=None, extra=None):
     """메인 진입점. 절대 raise하지 않음."""
     t0 = time.time()
     q = norm(query)
@@ -663,9 +679,7 @@ def search(query, curated=None):
     try:
         route = classify(q, curated)
         cat = route["category"]
-        chain = list(CHAIN.get(cat, CHAIN["general"]))
-        if cat not in ("최신 AI뉴스나 논란", "논문 제목"):
-            chain = chain + (["marginalia"] if "marginalia" not in chain else [])
+        chain = _with_extra(CHAIN.get(cat, CHAIN["general"]), extra)
         lang = detect_lang(q)
         tried = {}
         best = None

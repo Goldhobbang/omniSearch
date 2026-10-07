@@ -325,7 +325,6 @@ def _warmup():
     _WARMED = True
     try:
         time.sleep(3)
-        from duckduckgo_search import DDGS
         with DDGS() as ddgs:
             for q in ["서울", "Python", "김치찌개", "BTS"]:
                 try:

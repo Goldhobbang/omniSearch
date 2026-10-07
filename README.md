@@ -94,6 +94,8 @@ Manual start: `wsl -e bash src/omnisearch/searxng/start.sh` (Windows) / `bash sr
 | `CROSSREF_MAILTO` | — | contact email for Crossref polite pool |
 | `MARGINALIA_KEY` | `public` | dedicated free key |
 | `OMNI_PORT` | `5000` | web UI port |
+| `OMNI_DEADLINE` | `8` | max seconds one search waits; slow engines finish in background and fill the cache |
+| `OMNI_PATIENT` | `0` | `1` = wait/retry on rate limits instead of fail-fast cooldown (set by `eval/verify.py`) |
 
 ## Anti-junk design
 

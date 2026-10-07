@@ -25,6 +25,8 @@ import time
 import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import TimeoutError as FutureTimeout
 
 import requests
 try:
@@ -39,7 +41,7 @@ CACHE_DB = os.environ.get("OMNI_CACHE") or os.path.join(
     or os.path.expanduser("~/.cache"), "omnisearch", "cache.db")
 os.makedirs(os.path.dirname(CACHE_DB), exist_ok=True)
 CACHE_TTL = 7 * 86400
-UA = "OmniTool/1.0 (local research harness)"
+UA = "omniSearch/0.2 (+https://github.com/Goldhobbang/omniSearch)"
 
 _session = requests.Session()
 _session.headers.update({"User-Agent": UA, "Accept": "application/json"})
@@ -282,6 +284,22 @@ def looks_junk(query, items):
 _LAST_CALL = {}
 _POLITE_LOCK = threading.Lock()
 
+# 기본은 fail-fast: 429/차단이면 대기하지 않고 엔진을 COOLDOWN초 쉬게 한 뒤 즉시 포기.
+# 대량 배치(eval/verify.py)는 OMNI_PATIENT=1 로 기존 대기·재시도 동작 사용.
+PATIENT = os.environ.get("OMNI_PATIENT") == "1"
+DEADLINE = float(os.environ.get("OMNI_DEADLINE", "600" if PATIENT else "8"))  # 검색 1회 전체 대기 상한(초)
+COOLDOWN = 30
+_COOL_UNTIL = {}
+
+
+def _cool(label, seconds=COOLDOWN):
+    _COOL_UNTIL[label] = time.time() + seconds
+
+
+def _check_cool(label):
+    if time.time() < _COOL_UNTIL.get(label, 0):
+        raise ToolUnavailable(f"{label}: cooling down")
+
 
 def _polite(key, min_interval):
     with _POLITE_LOCK:
@@ -303,6 +321,9 @@ def _backoff_seconds(resp, attempt):
 
 
 def _get_json(url, params, timeout, label, min_interval=0.8, tries=4):
+    _check_cool(label)
+    if not PATIENT:
+        tries = min(tries, 2)
     for i in range(tries):
         _polite(label, min_interval)
         try:
@@ -313,6 +334,9 @@ def _get_json(url, params, timeout, label, min_interval=0.8, tries=4):
                 raise ToolUnavailable(f"{label}: net {e}")
             continue
         if r.status_code == 429:
+            if not PATIENT:
+                _cool(label, max(COOLDOWN, _backoff_seconds(r, 0)))
+                raise ToolUnavailable(f"{label}: 429 (cooldown)")
             if i == tries - 1:  # 마지막 시도면 대기 없이 바로 포기
                 raise ToolUnavailable(f"{label}: 429 persistent")
             time.sleep(_backoff_seconds(r, i))
@@ -418,7 +442,8 @@ def _ddg_once(kind, query, max_results):
 def _ddg_guarded(kind, query, max_results, norm_fn):
     """하드에러 30초후 1회 재시도 + junk 60초후 1회 재시도.
     junk(0점 또는 시그니처 매칭)는 캐시하지 않는다."""
-    if _DDG_FAILS[0] >= 6:
+    _check_cool("ddg")
+    if _DDG_FAILS[0] >= 6 and PATIENT:
         time.sleep(120)
         _DDG_FAILS[0] = 0
     last = None
@@ -429,6 +454,9 @@ def _ddg_guarded(kind, query, max_results, norm_fn):
             last = e
             if any(k in str(e).lower() for k in RATE_HINTS):
                 _DDG_FAILS[0] += 1
+                if not PATIENT:
+                    _cool("ddg")
+                    raise ToolUnavailable(f"ddg_{kind}: rate limited (cooldown)")
                 time.sleep(30)
                 continue
             raise ToolUnavailable(f"ddg_{kind}: {e}")
@@ -439,6 +467,9 @@ def _ddg_guarded(kind, query, max_results, norm_fn):
             return out, sc
         last = "junk-results-softblock"
         _DDG_FAILS[0] += 1
+        if not PATIENT:
+            _cool("ddg", 30)
+            break
         time.sleep(60)
     raise ToolUnavailable(f"ddg_{kind} blocked after retry: {last}")
 
@@ -588,7 +619,7 @@ def arxiv_search(query, max_results=8):
     _polite("arxiv", 3.0)
     try:
         r = _session.get("https://export.arxiv.org/api/query", params={
-            "search_query": f'all:"{query}"', "max_results": max_results},
+            "search_query": " AND ".join(f"all:{t}" for t in query.split()), "max_results": max_results},
             timeout=20)
         r.raise_for_status()
         root = ET.fromstring(r.content)
@@ -793,6 +824,9 @@ TOOL_LABELS = {
 }
 
 
+LAZY_ENGINES = {"you_search"}  # 일일 한도 있음 -> search()에서 선제 호출 안 함
+
+
 def _run_one(tool, q):
     try:
         items = [x for x in ENGINES[tool](q) if norm(x.get("title"))]
@@ -822,11 +856,15 @@ def multi_search(query, curated=None, extra=None):
         route = classify(q, curated)
         cat = route["category"]
         chain = _with_extra(CHAIN.get(cat, CHAIN["general"]), extra)
+        ex = ThreadPoolExecutor(max_workers=len(chain))
+        futs = {t: ex.submit(_run_one, t, q) for t in chain}
+        wait(futs.values(), timeout=DEADLINE)
+        ex.shutdown(wait=False)  # 늦은 엔진은 백그라운드에서 끝나 캐시만 채움
         tools = {}
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=len(chain)) as ex:
-            for tool, pack in ex.map(lambda t: _run_one(t, q), chain):
-                tools[tool] = pack
+        for t, fu in futs.items():
+            tools[t] = fu.result()[1] if fu.done() else {
+                "label": TOOL_LABELS.get(t, t), "items": [], "score": 0.0,
+                "status": "timeout", "detail": f">{DEADLINE}s"}
         ordered = sorted(tools, key=lambda t: tools[t]["score"], reverse=True)
         return {"query": q, "category": cat, "lang": detect_lang(q),
                 "method": route["method"], "reason": route["reason"],
@@ -850,9 +888,19 @@ def search(query, curated=None, extra=None):
         lang = detect_lang(q)
         tried = {}
         best = None
+        # 체인 전 엔진 동시 시작, 우선순위 순으로 결과 확인 -> 지연 = 첫 합격 엔진까지.
+        # 일일 한도 엔진(LAZY)은 차례가 왔을 때만 호출.
+        ex = ThreadPoolExecutor(max_workers=len(chain))
+        call = lambda t: [x for x in ENGINES[t](q) if norm(x.get("title"))]
+        futs = {t: ex.submit(call, t) for t in chain if t not in LAZY_ENGINES}
+        end = time.time() + DEADLINE
         for tool in chain:
+            fu = futs.get(tool) or ex.submit(call, tool)
             try:
-                items = [x for x in ENGINES[tool](q) if norm(x.get("title"))]
+                items = fu.result(timeout=max(0.1, end - time.time()))
+            except FutureTimeout:
+                tried[tool] = {"status": "timeout", "detail": f">{DEADLINE}s"}
+                continue
             except ToolUnavailable as e:
                 tried[tool] = {"status": "unavailable", "detail": str(e)[:120]}
                 continue
@@ -866,6 +914,7 @@ def search(query, curated=None, extra=None):
                 best = cand
             if sc >= 0.6 and items:
                 break
+        ex.shutdown(wait=False)
         if best and best[3]:
             _, _, tool, items = best
             return {"query": q, "category": cat, "lang": lang,

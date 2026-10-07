@@ -10,6 +10,7 @@ import os
 import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+os.environ.setdefault("OMNI_PATIENT", "1")  # 배치: 대기·재시도 허용
 from omnisearch import search  # noqa: E402
 
 WORDS = os.path.join(BASE_DIR, "words_1000.json")

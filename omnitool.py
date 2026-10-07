@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import time
 import unicodedata
 import urllib.parse
@@ -25,7 +26,7 @@ import urllib.parse
 import requests
 from duckduckgo_search import DDGS
 
-TOOL_VERSION = 5
+TOOL_VERSION = 6
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DB = os.path.join(BASE_DIR, "omnitool_cache.db")
 CACHE_TTL = 7 * 86400
@@ -202,7 +203,7 @@ def relevance(query, items, topk=3):
                 if ctok in tc or any(g in tc for g in gl):
                     hit += 1
             sc = max(sc, hit / len(ko_toks))
-        if len(qc) >= 4:
+        if len(qc) >= 6:
             qb, tb = _bigrams(qc), _bigrams(tc)
             if qb:
                 sc = max(sc, min(len(qb & tb) / len(qb), 0.75))
@@ -210,16 +211,63 @@ def relevance(query, items, topk=3):
     return round(best, 3)
 
 
+# ---------------- junk signatures ----------------
+# DDG 소프트블록 시 에러 대신 반환되는 무관련 결과 패턴 (실측 기록 기반).
+SPAM_DOMAINS = ("zhihu.com", "zhidao.baidu.com", "baidu.com")
+HOMEPAGE_URLS = (
+    "https://www.wikipedia.org/",
+    "https://en.wikipedia.org/wiki/Main_Page",
+    "https://ko.wikipedia.org/wiki/위키백과:대문",
+    "https://support.google.com/youtubetv/?hl=en",
+)
+
+
+def looks_junk(query, items):
+    """True면 소프트블록 junk로 보고 재시도 대상. 거짓양성 방지를 위해
+    관련도 0.6 이상이면 junk가 아니다."""
+    if not items or len(items) < 3:
+        return False
+    if relevance(query, items) >= 0.6:
+        return False
+    urls = [(it.get("url") or "") for it in items]
+    doms = [urllib.parse.urlparse(u).netloc.lower() for u in urls]
+    spam = sum(1 for d in doms if any(s in d for s in SPAM_DOMAINS))
+    home = sum(1 for u in urls
+               if u in HOMEPAGE_URLS or "/youtube/answer/57407" in u)
+    if spam >= 2 or home >= 2:
+        return True
+    # 한글 쿼리인데 상위 결과에 한글도, 영문 gloss/token 매칭도 없으면 junk.
+    # 단 쿼리 자체가 URL에 있으면 정상 (예: openai.com 질의).
+    q = norm(query)
+    if has_hangul(q) and not en_tokens(q):
+        blob = " ".join(norm(it.get("title", "")) + " "
+                        + norm(it.get("snippet", ""))
+                        for it in items[:3])
+        if not has_hangul(blob):
+            qt = []
+            for k, gl in SYN.items():
+                if k in compact(q):
+                    qt += gl
+            tt = en_tokens(blob)
+            overlap = any(w == x or (len(w) > 3 and x.startswith(w))
+                          for w in qt for x in tt)
+            if not overlap and compact(q) not in "".join(urls).lower():
+                return True
+    return False
+
+
 # ---------------- polite http ----------------
 _LAST_CALL = {}
+_POLITE_LOCK = threading.Lock()
 
 
 def _polite(key, min_interval):
-    now = time.time()
-    wait = min_interval - (now - _LAST_CALL.get(key, 0))
-    if wait > 0:
-        time.sleep(wait)
-    _LAST_CALL[key] = time.time()
+    with _POLITE_LOCK:
+        now = time.time()
+        wait = min_interval - (now - _LAST_CALL.get(key, 0))
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_CALL[key] = time.time()
 
 
 def _backoff_seconds(resp, attempt):
@@ -346,8 +394,8 @@ def _ddg_once(kind, query, max_results):
 
 
 def _ddg_guarded(kind, query, max_results, norm_fn):
-    """하드에러 30초후 1회 재시도 + junk(결과있는데 스코어0) 60초후 1회 재시도.
-    스코어 0인 결과는 캐시하지 않는다."""
+    """하드에러 30초후 1회 재시도 + junk 60초후 1회 재시도.
+    junk(0점 또는 시그니처 매칭)는 캐시하지 않는다."""
     if _DDG_FAILS[0] >= 6:
         time.sleep(120)
         _DDG_FAILS[0] = 0
@@ -363,7 +411,8 @@ def _ddg_guarded(kind, query, max_results, norm_fn):
                 continue
             raise ToolUnavailable(f"ddg_{kind}: {e}")
         sc = relevance(query, out)
-        if sc > 0 or len(out) < 3 or attempt == 1:
+        junk = looks_junk(query, out)
+        if (sc > 0 and not junk) or len(out) < 3 or attempt == 1:
             _DDG_FAILS[0] = 0
             return out, sc
         last = "junk-results-softblock"
@@ -380,7 +429,7 @@ def ddg_text(query, max_results=8):
     out, sc = _ddg_guarded("text", query, max_results, lambda raw: [
         {"title": r.get("title", "") or "", "url": r.get("href", "") or "",
          "snippet": r.get("body", "") or ""} for r in raw])
-    if sc > 0:
+    if sc > 0 and not looks_junk(query, out):
         cache_put(key, out)
     return out
 
@@ -393,7 +442,7 @@ def ddg_news(query, max_results=8):
     out, sc = _ddg_guarded("news", query, max_results, lambda raw: [
         {"title": r.get("title", "") or "", "url": r.get("url", "") or "",
          "snippet": r.get("body", "") or ""} for r in raw])
-    if sc > 0:
+    if sc > 0 and not looks_junk(query, out):
         cache_put(key, out)
     return out
 
@@ -473,7 +522,7 @@ def you_search(query, max_results=8):
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": {"name": "you-search",
                        "arguments": {"query": query, "count": max_results}}},
-            timeout=90)
+            timeout=60)
     except requests.RequestException as e:
         raise ToolUnavailable(f"you_search: net {e}")
     if r.status_code in (429, 402, 403):
@@ -559,6 +608,23 @@ TOOL_LABELS = {
 }
 
 
+def _run_one(tool, q):
+    try:
+        items = [x for x in ENGINES[tool](q) if norm(x.get("title"))]
+        sc = relevance(q, items)
+        return tool, {"label": TOOL_LABELS.get(tool, tool),
+                      "items": items[:10], "score": sc,
+                      "status": "ok", "count": len(items)}
+    except ToolUnavailable as e:
+        return tool, {"label": TOOL_LABELS.get(tool, tool),
+                      "items": [], "score": 0.0,
+                      "status": "unavailable", "detail": str(e)[:120]}
+    except Exception as e:
+        return tool, {"label": TOOL_LABELS.get(tool, tool),
+                      "items": [], "score": 0.0,
+                      "status": "error", "detail": str(e)[:120]}
+
+
 def multi_search(query, curated=None):
     """체인 내 전 엔진 실행 + 점수순 정렬. 절대 raise하지 않음.
     단일 best만 보던 search()와 달리 모든 sense를 보여줘서
@@ -574,22 +640,10 @@ def multi_search(query, curated=None):
         if "marginalia" not in chain:
             chain = chain + ["marginalia"]
         tools = {}
-        for tool in chain:
-            try:
-                items = [x for x in ENGINES[tool](q) if norm(x.get("title"))]
-                sc = relevance(q, items)
-                tools[tool] = {"label": TOOL_LABELS.get(tool, tool),
-                               "items": items[:10], "score": sc,
-                               "status": "ok", "count": len(items)}
-            except ToolUnavailable as e:
-                tools[tool] = {"label": TOOL_LABELS.get(tool, tool),
-                               "items": [], "score": 0.0,
-                               "status": "unavailable",
-                               "detail": str(e)[:120]}
-            except Exception as e:
-                tools[tool] = {"label": TOOL_LABELS.get(tool, tool),
-                               "items": [], "score": 0.0,
-                               "status": "error", "detail": str(e)[:120]}
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=len(chain)) as ex:
+            for tool, pack in ex.map(lambda t: _run_one(t, q), chain):
+                tools[tool] = pack
         ordered = sorted(tools, key=lambda t: tools[t]["score"], reverse=True)
         return {"query": q, "category": cat, "lang": detect_lang(q),
                 "method": route["method"], "reason": route["reason"],

@@ -1,0 +1,21 @@
+# omniSearch 로컬 SearXNG 설정. 기본값 위에 필요한 것만 덮어씀.
+# secret_key는 start.sh가 SEARXNG_SECRET 환경변수로 주입.
+use_default_settings: true
+
+general:
+  instance_name: omniSearch-local
+
+server:
+  bind_address: "127.0.0.1"
+  port: 8888
+  limiter: false
+  public_instance: false
+
+search:
+  formats:
+    - html
+    - json
+
+engines:
+  - name: naver
+    disabled: false

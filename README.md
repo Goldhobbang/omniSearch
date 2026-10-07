@@ -12,6 +12,7 @@ API키 없이 첫 검색에 최고품질을 주는 자립형 검색 라우터. �
 | DuckDuckGo text/news (`ddgs`) | general, slang, news | anti-bot hardening included |
 | Marginalia (`public` key) | English long-tail / indie web only (opt-in) | shared limit, usually 429 |
 | You.com keyless MCP (`?profile=free`) | general web | ~100/day, no signup |
+| SearXNG (local, WSL) | general web + Naver | `wsl -e bash searxng/start.sh`; skipped when down |
 | Semantic Scholar | paper titles | keyless shared limit, frequent 429 |
 | arXiv | paper titles | Atom API, 3s interval |
 | Crossref | paper titles | set `CROSSREF_MAILTO` env for polite pool |

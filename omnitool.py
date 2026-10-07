@@ -57,11 +57,11 @@ TECH_HINTS = ("양자", "초전도", "데이터베이스", "학습", "칩", "프
               "아키텍처", "알고리즘", "네트워크", "반도체", "protein", "quantum")
 
 CHAIN = {
-    "기관명": ["wikipedia", "duckduckgo", "you_search", "wikidata"],
-    "기술용어": ["wikipedia", "duckduckgo", "you_search"],
-    "entity": ["wikipedia", "duckduckgo", "you_search", "wikidata"],
-    "general": ["wikipedia", "duckduckgo", "you_search"],
-    "한국어 신조어": ["duckduckgo", "you_search", "wikipedia"],
+    "기관명": ["wikipedia", "searxng", "duckduckgo", "you_search", "wikidata"],
+    "기술용어": ["wikipedia", "searxng", "duckduckgo", "you_search"],
+    "entity": ["wikipedia", "searxng", "duckduckgo", "you_search", "wikidata"],
+    "general": ["wikipedia", "searxng", "duckduckgo", "you_search"],
+    "한국어 신조어": ["searxng", "duckduckgo", "you_search", "wikipedia"],
     "논문 제목": ["openalex", "semantic_scholar", "arxiv", "crossref",
               "wikipedia", "duckduckgo", "you_search"],
     "최신 AI뉴스나 논란": ["duckduckgo_news", "wikipedia", "you_search",
@@ -490,6 +490,28 @@ def marginalia_search(query, max_results=8):
     return out
 
 
+def searxng_search(query, max_results=8):
+    """로컬 SearXNG(WSL, searxng/start.sh). 꺼져 있으면 즉시 ToolUnavailable."""
+    key = f"v{TOOL_VERSION}:searxng:{query}:{max_results}"
+    c = cache_get(key)
+    if c is not None:
+        return c
+    base = os.environ.get("SEARXNG_URL", "http://127.0.0.1:8888")
+    try:
+        r = _session.get(f"{base}/search", params={"q": query, "format": "json"},
+                         timeout=(2, 15))
+        r.raise_for_status()
+        data = r.json()
+    except (requests.RequestException, ValueError) as e:
+        raise ToolUnavailable(f"searxng: {str(e)[:80]}")
+    out = [{"title": x.get("title", ""), "url": x.get("url", ""),
+            "snippet": x.get("content", "")}
+           for x in data.get("results", [])[:max_results]]
+    if out:  # 빈 결과(엔진 전부 차단)는 캐시 안 함
+        cache_put(key, out)
+    return out
+
+
 def semantic_scholar_search(query, max_results=8):
     """Semantic Scholar. 키 없으면 공유 한도라 429 잦음 -> tries=2로 빨리 포기."""
     key = f"v{TOOL_VERSION}:s2:{query}:{max_results}"
@@ -659,6 +681,7 @@ ENGINES = {
     "duckduckgo_news": ddg_news,
     "marginalia": marginalia_search,
     "you_search": you_search,
+    "searxng": searxng_search,
     "semantic_scholar": semantic_scholar_search,
     "arxiv": arxiv_search,
     "crossref": crossref_search,
@@ -718,6 +741,7 @@ TOOL_LABELS = {
     "duckduckgo_news": "DuckDuckGo 뉴스 (키 불필요)",
     "marginalia": "Marginalia 독립엔진 (키 불필요)",
     "you_search": "You.com keyless (키 불필요)",
+    "searxng": "SearXNG 로컬 메타검색 (키 불필요)",
     "semantic_scholar": "Semantic Scholar 논문 (키 불필요)",
     "arxiv": "arXiv 논문 (키 불필요)",
     "crossref": "Crossref 논문 (키 불필요)",

@@ -7,12 +7,10 @@
 import argparse
 import json
 import os
-import sys
 import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, BASE_DIR)
-from omnitool import search  # noqa: E402
+from omnisearch import search  # noqa: E402
 
 WORDS = os.path.join(BASE_DIR, "words_1000.json")
 PROG = os.path.join(BASE_DIR, "verify_progress.json")

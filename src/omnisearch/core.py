@@ -34,7 +34,10 @@ except ImportError:
 
 TOOL_VERSION = 7
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CACHE_DB = os.path.join(BASE_DIR, "omnitool_cache.db")
+CACHE_DB = os.environ.get("OMNI_CACHE") or os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME")
+    or os.path.expanduser("~/.cache"), "omnisearch", "cache.db")
+os.makedirs(os.path.dirname(CACHE_DB), exist_ok=True)
 CACHE_TTL = 7 * 86400
 UA = "OmniTool/1.0 (local research harness)"
 

@@ -1,4 +1,5 @@
-"""duckduckgo-search 라이브러리를 사용한 간단한 검색 웹페이지 (Flask 백엔드)."""
+"""omniSearch 웹 UI (Flask). 실행: omnisearch-web"""
+import os
 import threading
 import time
 
@@ -10,12 +11,8 @@ try:
 except ImportError:
     from duckduckgo_search import DDGS
 
-from smart_search import WORD_LISTS, classify, pick_random_word, smart_search
-from omnitool import multi_search
-
-# "multi": full engine chain (default). "legacy": old single-engine backend.
-# Instant rollback: flip to "legacy" and restart.
-SMART_BACKEND = "multi"
+from .core import multi_search
+from .wordlists import WORD_LISTS, pick_random_word
 
 app = Flask(__name__)
 
@@ -294,8 +291,6 @@ def api_smart_search():
     if not query:
         return jsonify({"error": "검색어(q)가 비어 있습니다."}), 400
     try:
-        if SMART_BACKEND == "legacy":
-            return jsonify(smart_search(query))
         r = multi_search(query)
         if r.get("error") and not r.get("tools"):
             return jsonify({"error": r["error"]}), 500
@@ -336,6 +331,11 @@ def _warmup():
         pass
 
 
-if __name__ == "__main__":
+def main():
+    port = int(os.environ.get("OMNI_PORT", "5000"))
     threading.Thread(target=_warmup, daemon=True).start()
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    app.run(host="127.0.0.1", port=port)
+
+
+if __name__ == "__main__":
+    main()

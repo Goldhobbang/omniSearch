@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnisearch"
+dynamic = ["version"]
+description = "Keyless multi-engine search router (Wikipedia, OpenAlex, arXiv, SearXNG, DuckDuckGo, ...)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = ["requests>=2.31", "ddgs>=9.0"]
+
+[project.optional-dependencies]
+web = ["Flask>=3.0"]
+mcp = ["mcp>=2.0"]
+
+[project.scripts]
+omnisearch = "omnisearch.cli:main"
+omnisearch-web = "omnisearch.web:main"
+omnisearch-mcp = "omnisearch.mcp_server:main"
+
+[project.urls]
+Repository = "https://github.com/Goldhobbang/omniSearch"
+
+[tool.setuptools.dynamic]
+version = { attr = "omnisearch.__version__" }
+
+[tool.setuptools.package-data]
+omnisearch = ["searxng/*"]

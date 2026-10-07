@@ -4,7 +4,6 @@
 """
 import json
 import os
-import sys
 import time
 
 import requests
@@ -51,8 +50,7 @@ def fetch_random_titles(lang, n):
 
 
 def main():
-    sys.path.insert(0, BASE_DIR)
-    from smart_search import WORD_LISTS
+    from omnisearch.wordlists import WORD_LISTS
 
     words = []
     seen = set()

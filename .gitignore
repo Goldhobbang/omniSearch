@@ -1,9 +1,10 @@
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+dist/
 *.db
 *.db-journal
-verify_progress.json
-probe_out.txt
-exp_out.jsonl
-spot.txt
+eval/verify_progress.json
+eval/spot.txt

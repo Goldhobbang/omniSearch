@@ -1,10 +1,7 @@
 # -*- coding: utf-8 -*-
 """junk 탐지/스코어러 단위테스트. 네트워크 없이 실행. recorded fixture 기반."""
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from omnitool import looks_junk, relevance
+from omnisearch.core import looks_junk, relevance
 
 # 실측 기록: DDG 소프트블록 시 반환된 junk (차등 프라이버시 질의)
 JUNK_ZHIHU = [

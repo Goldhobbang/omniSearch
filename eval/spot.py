@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 import io
-import sys
+import os
 
-sys.path.insert(0, ".")
-from omnitool import search, multi_search
+from omnisearch import search, multi_search
 
-OUT = io.open("spot.txt", "w", encoding="utf-8")
+OUT = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "spot.txt"), "w", encoding="utf-8")
 for q in ["Musgrave railway station", "데론가 제도", "갓생",
           "양자 얽힘", "Attention Is All You Need", "생성형 AI 저작권 소송",
           "토스뱅크"]:

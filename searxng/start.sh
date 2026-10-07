@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# WSL에서 로컬 SearXNG 실행. Windows에서: wsl -e bash searxng/start.sh
-# 최초 1회 설치(~/searxng, sudo 불필요):
-#   git clone --depth 1 https://github.com/searxng/searxng ~/searxng
-#   cd ~/searxng && python3 -m venv venv
-#   venv/bin/pip install -U pip setuptools wheel pyyaml msgspec typing-extensions pybind11
-#   venv/bin/pip install --use-pep517 --no-build-isolation -e .
+# 로컬 SearXNG 실행. 미설치면 install.sh 먼저 실행.
+# Linux/macOS: bash searxng/start.sh   Windows: wsl -e bash searxng/start.sh
+# omnitool은 서버가 꺼져 있으면 이 스크립트를 자동 실행함 (SEARXNG_AUTOSTART=0 으로 끔).
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
+DIR="${SEARXNG_HOME:-$HOME/searxng}"
+[ -x "$DIR/venv/bin/python" ] || bash "$HERE/install.sh"
 export SEARXNG_SETTINGS_PATH="$HERE/settings.yml"
 export SEARXNG_SECRET="${SEARXNG_SECRET:-$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
-cd ~/searxng
+cd "$DIR"
 exec venv/bin/python searx/webapp.py

@@ -17,7 +17,9 @@ import html
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 import unicodedata
@@ -490,20 +492,59 @@ def marginalia_search(query, max_results=8):
     return out
 
 
+_SEARXNG_LOCK = threading.Lock()
+_SEARXNG_TRIED = False
+
+
+def _searxng_autostart(base):
+    """로컬 SearXNG가 꺼져 있으면 searxng/start.sh를 1회 띄우고 최대 60초 대기.
+    Windows는 WSL 경유. 끄기: SEARXNG_AUTOSTART=0. 프로세스당 1회만 시도."""
+    global _SEARXNG_TRIED
+    if os.environ.get("SEARXNG_AUTOSTART", "1") == "0" or "127.0.0.1" not in base             and "localhost" not in base:
+        return False
+    with _SEARXNG_LOCK:
+        if _SEARXNG_TRIED:
+            return False
+        _SEARXNG_TRIED = True
+        if os.name == "nt":
+            if not shutil.which("wsl"):
+                return False
+            cmd, kw = ["wsl", "-e", "bash", "searxng/start.sh"], {
+                "creationflags": subprocess.DETACHED_PROCESS
+                | subprocess.CREATE_NEW_PROCESS_GROUP}
+        else:
+            cmd, kw = ["bash", "searxng/start.sh"], {"start_new_session": True}
+        subprocess.Popen(cmd, cwd=BASE_DIR, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+        for _ in range(60):  # 첫 실행은 install.sh 포함이라 오래 걸릴 수 있음
+            time.sleep(1)
+            try:
+                if _session.get(f"{base}/healthz", timeout=1).ok:
+                    return True
+            except requests.RequestException:
+                pass
+        return False
+
+
 def searxng_search(query, max_results=8):
-    """로컬 SearXNG(WSL, searxng/start.sh). 꺼져 있으면 즉시 ToolUnavailable."""
+    """로컬 SearXNG (searxng/start.sh). 꺼져 있으면 자동 실행 1회 시도."""
     key = f"v{TOOL_VERSION}:searxng:{query}:{max_results}"
     c = cache_get(key)
     if c is not None:
         return c
     base = os.environ.get("SEARXNG_URL", "http://127.0.0.1:8888")
-    try:
-        r = _session.get(f"{base}/search", params={"q": query, "format": "json"},
-                         timeout=(2, 15))
-        r.raise_for_status()
-        data = r.json()
-    except (requests.RequestException, ValueError) as e:
-        raise ToolUnavailable(f"searxng: {str(e)[:80]}")
+    for attempt in range(2):
+        try:
+            r = _session.get(f"{base}/search",
+                             params={"q": query, "format": "json"}, timeout=(2, 15))
+            r.raise_for_status()
+            data = r.json()
+            break
+        except requests.ConnectionError as e:
+            if attempt or not _searxng_autostart(base):
+                raise ToolUnavailable(f"searxng: down ({str(e)[:60]})")
+        except (requests.RequestException, ValueError) as e:
+            raise ToolUnavailable(f"searxng: {str(e)[:80]}")
     out = [{"title": x.get("title", ""), "url": x.get("url", ""),
             "snippet": x.get("content", "")}
            for x in data.get("results", [])[:max_results]]

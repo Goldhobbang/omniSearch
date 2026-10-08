@@ -38,6 +38,10 @@ r = search("Attention Is All You Need")   # never raises
 m = multi_search("StayFree")              # all senses, sorted by score
 ```
 
+전문용어·동명이의(`Opus`, `venv`, `backbone`, `DataLoader`류)는 `search()`가
+위키 일반의미 1개만 고를 수 있으니 `multi_search()`로 sense별 전부를 보고 고르세요.
+단일 best가 필요하면 `search()`의 `used_tool`/`score`로 판단.
+
 ### MCP server
 
 Tools: `search(query)`, `multi_search(query)` over stdio.
@@ -81,17 +85,20 @@ API: `GET /api/smart-search?q=...`, `GET /api/search?q=...&type=text|images|news
 Runs locally (`127.0.0.1:8888`) from `src/omnisearch/searxng/`. On the first search where it is down,
 omniSearch runs `start.sh` once (Windows: through WSL), which installs SearXNG into `~/searxng`
 if missing (needs `git`, `python3`, `python3-venv`; no sudo). No Docker.
+After boot one warmup query runs so the first real search skips cold-start stragglers.
 Manual start: `wsl -e bash src/omnisearch/searxng/start.sh` (Windows) / `bash src/omnisearch/searxng/start.sh`.
 
 ## Configuration (env)
 
 | Var | Default | |
 |---|---|---|
-| `OMNI_CACHE` | `%LOCALAPPDATA%\omnisearch\cache.db` / `~/.cache/omnisearch/cache.db` | sqlite cache, 7-day TTL |
+| `OMNI_CACHE` | `%LOCALAPPDATA%\omnisearch\cache.db` / `~/.cache/omnisearch/cache.db` | sqlite cache: 뉴스/웹 2일, 공식API·You 30일, 기타 7일 |
 | `OMNI_EXTRA` | — | comma list of opt-in engines (`marginalia`) |
 | `SEARXNG_URL` | `http://127.0.0.1:8888` | |
 | `SEARXNG_AUTOSTART` | `1` | `0` disables auto start |
 | `CROSSREF_MAILTO` | — | contact email for Crossref polite pool |
+| `OPENALEX_MAILTO` | — | contact email for OpenAlex polite pool |
+| `SEMANTIC_SCHOLAR_KEY` | — | S2 API key: 있으면 인증 한도(1r/s)로 호출 간격 단축 |
 | `MARGINALIA_KEY` | `public` | dedicated free key |
 | `OMNI_PORT` | `5000` | web UI port |
 | `OMNI_DEADLINE` | `4` | max seconds one search waits; slow engines finish in background and fill the cache |
@@ -101,6 +108,8 @@ Manual start: `wsl -e bash src/omnisearch/searxng/start.sh` (Windows) / `bash sr
 
 - `search()` starts the non-fallback engines of a chain at once and returns the first result that
   passes, in priority order; slow engines finish in the background and fill the cache.
+- tiered wait: official APIs 1.5s, SearXNG 3s, whole search `OMNI_DEADLINE` (4s);
+  a tier timeout is skipped first and reaped later only if nothing passed (2-phase).
 - per-engine call spacing reserves a slot and sleeps outside the lock, so one engine's wait never
   blocks another; a queue longer than the deadline is skipped instead of waited on.
 - 429 / soft block: the engine cools down 30s, doubling on each repeat (max 10 min), reset on success.

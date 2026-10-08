@@ -11,7 +11,7 @@ try:
 except ImportError:
     from duckduckgo_search import DDGS
 
-from .core import multi_search
+from .core import multi_search, warmup_searxng
 from .wordlists import WORD_LISTS, pick_random_word
 
 app = Flask(__name__)
@@ -313,7 +313,7 @@ _WARMED = False
 
 
 def _warmup():
-    """서버 시작 시 DDG 신뢰도 예열 (콜드스타트 junk 방지). 실패해도 무시."""
+    """서버 시작 시 DDG 신뢰도 + SearXNG 업스트림 예열. 실패해도 무시."""
     global _WARMED
     if _WARMED:
         return
@@ -327,6 +327,7 @@ def _warmup():
                 except Exception:
                     pass
                 time.sleep(2)
+        warmup_searxng()
     except Exception:
         pass
 

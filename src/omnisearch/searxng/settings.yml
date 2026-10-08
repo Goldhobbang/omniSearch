@@ -16,6 +16,21 @@ search:
     - html
     - json
 
+outgoing:
+  # 전역 업스트림 대기 상한 (기본 3.0s). omniSearch Tier2(3s)와 정합.
+  request_timeout: 2.0
+
 engines:
   - name: naver
     disabled: false
+  # 실측 사망 엔진 (unresponsive_engines 5/5 프로브):
+  # brave.* = 상시 rate-limit, google news = access denied, reuters = 상시 timeout.
+  # naver/ddg/wikipedia는 일시적 timeout이라 유지 (한글·즉답 가치).
+  - name: brave
+    disabled: true
+  - name: brave.news
+    disabled: true
+  - name: google news
+    disabled: true
+  - name: reuters
+    disabled: true

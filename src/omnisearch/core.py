@@ -41,6 +41,22 @@ CACHE_DB = os.environ.get("OMNI_CACHE") or os.path.join(
     or os.path.expanduser("~/.cache"), "omnisearch", "cache.db")
 os.makedirs(os.path.dirname(CACHE_DB), exist_ok=True)
 CACHE_TTL = 7 * 86400
+CACHE_TTL_SHORT = 2 * 86400   # 자주 변하는 뉴스/웹메타: searxng, ddg, gdelt
+CACHE_TTL_LONG = 30 * 86400   # 잘 안 변하는 공식API + 쿼터제 you (재호출·한도 절약)
+
+
+def _ttl_for(key):
+    """캐시키 prefix별 TTL. v{N}:{prefix}:... 형식에서 prefix 판별."""
+    try:
+        prefix = (key or "").split(":")[1]
+    except Exception:
+        return CACHE_TTL
+    if prefix in ("searxng", "ddg", "ddgn", "gdelt"):
+        return CACHE_TTL_SHORT
+    if prefix in ("wiki", "openalex", "crossref", "wikidata", "arxiv",
+                  "you", "s2"):
+        return CACHE_TTL_LONG
+    return CACHE_TTL
 UA = "omniSearch/0.2 (+https://github.com/Goldhobbang/omniSearch)"
 
 _session = requests.Session()
@@ -105,7 +121,7 @@ def cache_get(key):
         con = _db()
         row = con.execute("SELECT v, ts FROM c WHERE k=?", (key,)).fetchone()
         con.close()
-        if row and (time.time() - row[1]) < CACHE_TTL:
+        if row and (time.time() - row[1]) < _ttl_for(key):
             return json.loads(row[0])
     except Exception:
         return None
@@ -188,9 +204,51 @@ def _bigrams(s):
     return {s[i:i + 2] for i in range(len(s) - 1)}
 
 
+def _score_one(qc, qt, ko_toks, var, text, title_side):
+    """단일 텍스트(제목 또는 스니펫)에 대한 관련도 0~1.
+    제목과 스니펫을 분리 평가한다. 스니펫(title_side=False)은 상한 0.5:
+    본문 언급만으로는 1.0을 주지 않는다 (예: venv 질의에 스니펫 "O Venvs"
+    가 포함된 메탈 앨범 문서가 1.0을 받는 오답 방지)."""
+    tc = compact(text)
+    sc = 0.0
+    if qc and any(v and (v in tc or tc in v) for v in var):
+        sc = 1.0
+    tt = en_tokens(text)
+    if qt and tt:
+        hit = 0
+        for w in qt:
+            for x in tt:
+                # 어간 매칭은 길이 차이가 2자 이내일 때만 (dataloader->data 같은
+                # 과도한 축약 매칭 방지, model->models 같은 복수형은 허용).
+                if w == x or (len(w) > 3 and len(w) >= len(x) - 2 and x.startswith(w)) \
+                        or (len(x) > 3 and len(x) >= len(w) - 2 and w.startswith(x)):
+                    hit += 1
+                    break
+        sc = max(sc, hit / len(qt))
+    if ko_toks:
+        hit = 0
+        for tok in ko_toks:
+            ctok = compact(tok)
+            gl = []
+            for k, g in SYN.items():
+                if k in tok:
+                    gl += g
+            if ctok in tc or any(g in tc for g in gl):
+                hit += 1
+        sc = max(sc, hit / len(ko_toks))
+    if len(qc) >= 6:
+        qb, tb = _bigrams(qc), _bigrams(tc)
+        if qb:
+            sc = max(sc, min(len(qb & tb) / len(qb), 0.75))
+    if not title_side:
+        sc = min(sc, 0.5)
+    return round(sc, 3)
+
+
 def relevance(query, items, topk=3):
     """상위 topk 중 최적 관련도 0~1.
-    4경로: 동일문자/변형(1.0) + 영문토큰 + 한국어토큰(+동의어) + 바이그램재현율(상한 0.75)."""
+    4경로: 동일문자/변형(제목 매칭시 1.0) + 영문토큰 + 한국어토큰(+동의어)
+    + 바이그램재현율(상한 0.75). 스니펫만 매칭되면 0.5 상한."""
     q = norm(query)
     qc = compact(q)
     qt = en_tokens(q)
@@ -202,37 +260,9 @@ def relevance(query, items, topk=3):
     var = _variants(qc)
     best = 0.0
     for it in (items or [])[:topk]:
-        t = norm(it.get("title", "")) + " " + norm(it.get("snippet", ""))
-        tc = compact(t)
-        sc = 0.0
-        if qc and any(v and (v in tc or tc in v) for v in var):
-            sc = 1.0
-        tt = en_tokens(t)
-        if qt and tt:
-            hit = 0
-            for w in qt:
-                for x in tt:
-                    if w == x or (len(w) > 3 and x.startswith(w)) \
-                            or (len(x) > 3 and w.startswith(x)):
-                        hit += 1
-                        break
-            sc = max(sc, hit / len(qt))
-        if ko_toks:
-            hit = 0
-            for tok in ko_toks:
-                ctok = compact(tok)
-                gl = []
-                for k, g in SYN.items():
-                    if k in tok:
-                        gl += g
-                if ctok in tc or any(g in tc for g in gl):
-                    hit += 1
-            sc = max(sc, hit / len(ko_toks))
-        if len(qc) >= 6:
-            qb, tb = _bigrams(qc), _bigrams(tc)
-            if qb:
-                sc = max(sc, min(len(qb & tb) / len(qb), 0.75))
-        best = max(best, sc)
+        st = _score_one(qc, qt, ko_toks, var, norm(it.get("title", "")), True)
+        ss = _score_one(qc, qt, ko_toks, var, norm(it.get("snippet", "")), False)
+        best = max(best, st, ss)
     return round(best, 3)
 
 
@@ -336,14 +366,16 @@ def _backoff_seconds(resp, attempt):
     return (5, 15, 40)[min(attempt, 2)]
 
 
-def _get_json(url, params, timeout, label, min_interval=0.8, tries=4):
+def _get_json(url, params, timeout, label, min_interval=0.8, tries=4,
+              headers=None):
     _check_cool(label)
     if not PATIENT:
         tries = min(tries, 2)
     for i in range(tries):
         _polite(label, min_interval)
         try:
-            r = _session.get(url, params=params, timeout=timeout)
+            r = _session.get(url, params=params, timeout=timeout,
+                             headers=headers)
         except requests.RequestException as e:
             time.sleep(3 * (i + 1))
             if i == tries - 1:
@@ -371,26 +403,42 @@ def _get_json(url, params, timeout, label, min_interval=0.8, tries=4):
                 raise ToolUnavailable(f"{label}: bad json persistent")
             continue
     raise ToolUnavailable(f"{label}: retries exhausted")
+def _wiki_lang(query, lang, max_results):
+    data = _get_json(f"https://{lang}.wikipedia.org/w/api.php", {
+        "action": "query", "list": "search", "srsearch": query,
+        "format": "json", "formatversion": "2", "srlimit": max_results,
+    }, 15, "wikipedia", min_interval=0.2)
+    out = []
+    for item in data.get("query", {}).get("search", []):
+        title = item.get("title", "")
+        url = f"https://{lang}.wikipedia.org/wiki/" + urllib.parse.quote(
+            title.replace(" ", "_"))
+        out.append({"title": title, "url": url,
+                    "snippet": strip_tags(item.get("snippet", ""))})
+    return out
+
+
 def wiki_search(query, max_results=8):
     key = f"v{TOOL_VERSION}:wiki:{query}:{max_results}"
     c = cache_get(key)
     if c is not None:
         return c
-    out = []
+    # ko/en 동시 발사 (순차 대비 지연 반감). 한도 넉넉한 공식 API라 병렬 안전.
     langs = ["ko", "en"] if has_hangul(query) else ["en", "ko"]
+    ex = ThreadPoolExecutor(max_workers=2)
+    futs = {lang: ex.submit(_wiki_lang, query, lang, max_results)
+            for lang in langs}
+    ex.shutdown(wait=False)
+    out, errs = [], []
     for lang in langs:
-        data = _get_json(f"https://{lang}.wikipedia.org/w/api.php", {
-            "action": "query", "list": "search", "srsearch": query,
-            "format": "json", "formatversion": "2", "srlimit": max_results,
-        }, 15, "wikipedia")
-        for item in data.get("query", {}).get("search", []):
-            title = item.get("title", "")
-            url = f"https://{lang}.wikipedia.org/wiki/" + urllib.parse.quote(
-                title.replace(" ", "_"))
-            out.append({"title": title, "url": url,
-                        "snippet": strip_tags(item.get("snippet", ""))})
+        try:
+            out.extend(futs[lang].result(timeout=15))
+        except Exception as e:
+            errs.append(e)
         if len(out) >= 2:
             break
+    if not out and errs:
+        raise errs[0]
     cache_put(key, out)
     return out
 
@@ -400,10 +448,14 @@ def openalex_search(query, max_results=8):
     c = cache_get(key)
     if c is not None:
         return c
-    data = _get_json("https://api.openalex.org/works", {
+    params = {
         "search": query, "per-page": max_results,
         "select": "id,title,doi,publication_year,cited_by_count,authorships",
-    }, 20, "openalex", min_interval=0.5)
+    }
+    if os.environ.get("OPENALEX_MAILTO"):
+        params["mailto"] = os.environ["OPENALEX_MAILTO"]
+    data = _get_json("https://api.openalex.org/works", params, 20, "openalex",
+                     min_interval=0.2)
     out = []
     for w in data.get("results", []):
         authors = ", ".join(
@@ -443,8 +495,9 @@ RATE_HINTS = ("429", "202", "rate", "limit", "timeout", "timed out", "empty",
 
 
 def _ddg_once(kind, query, max_results):
-    """단발 호출. 세션은 매번 재생성(오염된 세션 재사용 방지)."""
-    _polite("ddg", 3.0)
+    """단발 호출. 세션은 매번 재생성(오염된 세션 재사용 방지).
+    예비 엔진이라 호출 빈도가 낮아 간격 1.5s로도 블록 위험 낮음."""
+    _polite("ddg", 1.5)
     ddgs = DDGS()
     try:
         # backend 명시: 기본 "auto"는 여러 엔진을 2개씩 순차로 도는 메타검색이라 10초+.
@@ -494,7 +547,7 @@ def _ddg_guarded(kind, query, max_results, norm_fn):
     raise ToolUnavailable(f"ddg_{kind} blocked after retry: {last}")
 
 
-def ddg_text(query, max_results=8):
+def ddg_text(query, max_results=5):
     key = f"v{TOOL_VERSION}:ddg:{query}:{max_results}"
     c = cache_get(key)
     if c is not None:
@@ -507,7 +560,7 @@ def ddg_text(query, max_results=8):
     return out
 
 
-def ddg_news(query, max_results=8):
+def ddg_news(query, max_results=5):
     key = f"v{TOOL_VERSION}:ddgn:{query}:{max_results}"
     c = cache_get(key)
     if c is not None:
@@ -550,6 +603,24 @@ _SEARXNG_LOCK = threading.Lock()
 _SEARXNG_TRIED = False
 
 
+def warmup_searxng(base=None):
+    """SearXNG 업스트림 예열: 일시적 straggler(ddg/naver 등)를 미리 suspend시켜
+    다음 실검색이 full-timeout을 안 먹게 한다. HTTP GET만 하고 캐시에 기록하지
+    않으며, 성공/실패를 따지지 않는다. 기동 직후 1회가 목적."""
+    try:
+        base = base or os.environ.get("SEARXNG_URL", "http://127.0.0.1:8888")
+        for cat, q in (("general", "날씨"), ("news", "속보")):
+            try:
+                _session.get(f"{base}/search",
+                             params={"q": q, "format": "json",
+                                     "categories": cat},
+                             timeout=(2, 6))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _searxng_autostart(base):
     """로컬 SearXNG가 꺼져 있으면 searxng/start.sh를 1회 띄우고 최대 60초 대기.
     Windows는 WSL 경유. 끄기: SEARXNG_AUTOSTART=0. 프로세스당 1회만 시도."""
@@ -574,6 +645,7 @@ def _searxng_autostart(base):
             time.sleep(1)
             try:
                 if _session.get(f"{base}/healthz", timeout=1).ok:
+                    warmup_searxng(base)  # 콜드스타트 straggler 예열 후 반환
                     return True
             except requests.RequestException:
                 pass
@@ -595,7 +667,7 @@ def searxng_search(query, max_results=8, category="general"):
         try:
             r = _session.get(f"{base}/search",
                              params={"q": query, "format": "json",
-                                     "categories": category}, timeout=(2, 15))
+                                     "categories": category}, timeout=(1.5, 8))
             r.raise_for_status()
             data = r.json()
             break
@@ -613,15 +685,19 @@ def searxng_search(query, max_results=8, category="general"):
 
 
 def semantic_scholar_search(query, max_results=8):
-    """Semantic Scholar. 키 없으면 공유 한도라 429 잦음 -> tries=2로 빨리 포기."""
+    """Semantic Scholar. 키 없으면 공유 한도라 429 잦음 -> tries=2로 빨리 포기.
+    SEMANTIC_SCHOLAR_KEY가 있으면 인증 한도(1r/s)로 간격 단축."""
     key = f"v{TOOL_VERSION}:s2:{query}:{max_results}"
     c = cache_get(key)
     if c is not None:
         return c
+    s2_key = os.environ.get("SEMANTIC_SCHOLAR_KEY")
     data = _get_json("https://api.semanticscholar.org/graph/v1/paper/search", {
         "query": query, "limit": max_results,
         "fields": "title,url,year,citationCount,authors",
-    }, 15, "semantic_scholar", min_interval=1.1, tries=2)
+    }, 15, "semantic_scholar",
+        min_interval=0.2 if s2_key else 1.1, tries=2,
+        headers={"x-api-key": s2_key} if s2_key else None)
     out = []
     for p in data.get("data") or []:
         authors = ", ".join(a.get("name", "") for a in (p.get("authors") or [])[:3])
@@ -677,7 +753,8 @@ def crossref_search(query, max_results=8):
               "select": "title,DOI,URL,issued,is-referenced-by-count"}
     if os.environ.get("CROSSREF_MAILTO"):
         params["mailto"] = os.environ["CROSSREF_MAILTO"]
-    data = _get_json("https://api.crossref.org/works", params, 20, "crossref")
+    data = _get_json("https://api.crossref.org/works", params, 20, "crossref",
+                     min_interval=0.3)
     out = []
     for w in data.get("message", {}).get("items", []):
         year = ((w.get("issued") or {}).get("date-parts") or [[None]])[0][0]
@@ -699,7 +776,7 @@ def wikidata_search(query, max_results=8):
     data = _get_json("https://www.wikidata.org/w/api.php", {
         "action": "wbsearchentities", "search": query, "language": lang,
         "uselang": lang, "limit": max_results, "format": "json",
-    }, 15, "wikidata")
+    }, 15, "wikidata", min_interval=0.3)
     out = [{"title": e.get("label", ""),
             "url": "https://www.wikidata.org/wiki/" + e.get("id", ""),
             "snippet": e.get("description", "")}
@@ -746,8 +823,9 @@ def _parse_mcp_sse(text):
     return []
 
 
-def you_search(query, max_results=8):
-    """You.com keyless MCP (?profile=free, 일 100회). 키 발급 없음."""
+def you_search(query, max_results=5):
+    """You.com keyless MCP (?profile=free, 일 100회). 키 발급 없음.
+    쿼터 보호: 5건 + 타임아웃 10s + 캐시 30일."""
     key = f"v{TOOL_VERSION}:you:{query}:{max_results}"
     c = cache_get(key)
     if c is not None:
@@ -760,7 +838,7 @@ def you_search(query, max_results=8):
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": {"name": "you-search",
                        "arguments": {"query": query, "count": max_results}}},
-            timeout=60)
+            timeout=10)
     except requests.RequestException as e:
         raise ToolUnavailable(f"you_search: net {e}")
     if r.status_code in (429, 402, 403):
@@ -859,7 +937,22 @@ TOOL_LABELS = {
 
 
 # search()에서 차례가 와야 호출: you_search는 일일 한도, ddg는 차단이 잦은 예비 엔진.
-LAZY_ENGINES = {"you_search", "duckduckgo", "duckduckgo_news"}
+# arxiv는 규칙상 3초 간격이라 deadline을 갉아먹으므로 차례 호출로 강등
+# (OpenAlex+Crossref가 논문의 95%를 커버).
+LAZY_ENGINES = {"you_search", "duckduckgo", "duckduckgo_news", "arxiv"}
+
+
+# Tier별 1차 대기 상한: 공식API 1.5s 안에 못 오면 일단 건너뛰고, searxng는
+# 3s까지. 1차 순회가 불발이면 전체 DEADLINE까지 늦은 엔진을 회수 (품질 보존).
+TIER_TIMEOUT = {"wikipedia": 1.5, "wikidata": 1.5, "openalex": 1.5,
+                "crossref": 1.5, "searxng": 3.0, "searxng_news": 3.0}
+
+
+# 도메인 전문용어(entity/기술용어)는 위키 일반의미가 문자열 매칭으로 고득점을
+# 받아 체인을 끊어버리는 문제를 피하려고 조기채택 임계를 상향: 임계 미만이면
+# searxng까지 보고 best를 선택한다 (예: DataLoader ETL 문서 0.75 -> PyTorch
+# 튜토리얼 1.0으로 교정). 그 외 카테고리는 0.6 유지 (지연 우선).
+STOP_SCORE = {"기술용어": 0.8, "entity": 0.8}
 
 
 def _run_one(tool, q):
@@ -911,7 +1004,9 @@ def multi_search(query, curated=None, extra=None):
 
 
 def search(query, curated=None, extra=None):
-    """메인 진입점. 절대 raise하지 않음."""
+    """메인 진입점. 절대 raise하지 않음.
+    전문용어·동명이의(Opus/venv/backbone류)는 단일 best 대신 sense별 전부를
+    보여주는 multi_search() 권장."""
     t0 = time.time()
     q = norm(query)
     if not q:
@@ -924,20 +1019,25 @@ def search(query, curated=None, extra=None):
         tried = {}
         best = None
         # 체인 전 엔진 동시 시작, 우선순위 순으로 결과 확인 -> 지연 = 첫 합격 엔진까지.
-        # 일일 한도 엔진(LAZY)은 차례가 왔을 때만 호출.
+        # Tier 타임아웃: 빠른 엔진이 늦으면 일단 건너뛰고, 1차 불발시에만
+        # 전체 DEADLINE까지 회수 (2차). 일일 한도 엔진(LAZY)은 차례가 왔을 때만 호출.
         ex = ThreadPoolExecutor(max_workers=len(chain))
         call = lambda t: [x for x in ENGINES[t](q) if norm(x.get("title"))]
         futs = {t: ex.submit(call, t) for t in chain if t not in LAZY_ENGINES}
         end = time.time() + DEADLINE
+        pending = []
         for i, tool in enumerate(chain):
             if tool not in futs:  # 예비 엔진 차례 = 앞 엔진 전부 불합격 -> 남은 예비 동시 시작
                 for t in chain[i:]:
                     futs.setdefault(t, ex.submit(call, t))
             fu = futs[tool]
             try:
-                items = fu.result(timeout=max(0.1, end - time.time()))
+                items = fu.result(timeout=max(
+                    0.1, min(TIER_TIMEOUT.get(tool, DEADLINE),
+                             end - time.time())))
             except FutureTimeout:
                 tried[tool] = {"status": "timeout", "detail": f">{DEADLINE}s"}
+                pending.append(tool)
                 continue
             except ToolUnavailable as e:
                 tried[tool] = {"status": "unavailable", "detail": str(e)[:120]}
@@ -950,8 +1050,26 @@ def search(query, curated=None, extra=None):
             cand = (sc, len(items), tool, items)
             if best is None or (sc, len(items)) > (best[0], best[1]):
                 best = cand
-            if sc >= 0.6 and items:
+            if sc >= STOP_SCORE.get(cat, 0.6) and items:
+                pending = []
                 break
+        for tool in pending:  # 2차: 1차 불발시에만 늦은 엔진 회수
+            try:
+                items = futs[tool].result(timeout=max(0.1, end - time.time()))
+            except FutureTimeout as e:
+                tried[tool] = {"status": "timeout", "detail": str(e)[:60]}
+                continue
+            except ToolUnavailable as e:
+                tried[tool] = {"status": "unavailable", "detail": str(e)[:120]}
+                continue
+            except Exception as e:
+                tried[tool] = {"status": "error", "detail": str(e)[:120]}
+                continue
+            sc = relevance(q, items)
+            tried[tool] = {"status": "ok", "n": len(items), "score": sc}
+            cand = (sc, len(items), tool, items)
+            if best is None or (sc, len(items)) > (best[0], best[1]):
+                best = cand
         ex.shutdown(wait=False)
         if best and best[3]:
             _, _, tool, items = best

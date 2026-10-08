@@ -46,6 +46,40 @@ LEGIT_EN_FOR_KO = [  # 한글 질의에 영문 정답 (differential privacy)
     {"title": "Differential privacy library",
      "url": "https://example.com/lib", "snippet": "differential privacy"},
 ]
+# 실측 기록: venv 질의에 위키가 반환한 오답 (스니펫 "O Venvs" 포함 메탈 앨범).
+# 제목 매칭 없이는 고득점이 나오면 안 된다.
+VENV_WIKI_JUNK = [
+    {"title": "The Shit Ov God",
+     "url": "https://en.wikipedia.org/wiki/The_Shit_Ov_God",
+     "snippet": "\"Lvciferaeon\" 4:16 5. \"To Drown the Svn in Wine\" 3:29 6. \"O Venvs, Come!\" 5:55"},
+    {"title": "Mária Széchy",
+     "url": "https://en.wikipedia.org/wiki/M%C3%A1ria_Sz%C3%A9chy",
+     "snippet": "Muranyi Venvs, printed in 1664 in Kassa"},
+]
+VENV_GOOD = [
+    {"title": "파이썬의 venv 모듈로 가상 환경 사용하기",
+     "url": "https://daleseo.com/python-venv/", "snippet": "가상 환경"},
+]
+# 실측 기록: DataLoader 질의에 위키 ETL 문서 (PyTorch 의미 아님).
+# dataloader->data 과도 축약 매칭 + 스니펫 매칭으로는 0.8을 넘으면 안 된다.
+DATALOADER_WIKI = [
+    {"title": "Extract, transform, load",
+     "url": "https://en.wikipedia.org/wiki/Extract%2C_transform%2C_load",
+     "snippet": "Extract, transform, load (ETL) is a three-phase computing process where data are extracted"},
+    {"title": "Data loading",
+     "url": "https://en.wikipedia.org/wiki/Data_loading",
+     "snippet": "Data loading, or simply loading, is a part of data processing"},
+]
+DATALOADER_GOOD = [
+    {"title": "Dataset과 DataLoader — 파이토치 한국어 튜토리얼",
+     "url": "https://tutorials.pytorch.kr/beginner/basics/data_tutorial.html", "snippet": ""},
+]
+# 실측 기록: 30B 질의 Sarvam AI 문서 (제목 무관, 스니펫에만 "30B").
+THIRTYB_SNIPPET_ONLY = [
+    {"title": "Sarvam AI",
+     "url": "https://en.wikipedia.org/wiki/Sarvam_AI",
+     "snippet": "the company announced Sarvam-30B, a 30-billion parameter model"},
+]
 
 
 def check(name, cond):
@@ -67,4 +101,14 @@ check("exact still 1.0",
       relevance("차등 프라이버시", LEGIT_DP) == 1.0)
 check("samgui scores",
       relevance("삼귀다", LEGIT_SAMGUI) >= 0.6)
+check("snippet-only match never passes (venv)",
+      relevance("venv", VENV_WIKI_JUNK) < 0.6)
+check("title match still 1.0 (venv)",
+      relevance("venv", VENV_GOOD) == 1.0)
+check("over-stemming blocked (dataloader->data)",
+      relevance("DataLoader", DATALOADER_WIKI) < 0.8)
+check("title match still 1.0 (dataloader)",
+      relevance("DataLoader", DATALOADER_GOOD) == 1.0)
+check("snippet-only capped at 0.5 (30B)",
+      relevance("30B", THIRTYB_SNIPPET_ONLY) <= 0.5)
 print("ALL JUNK TESTS PASSED")

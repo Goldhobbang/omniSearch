@@ -9,3 +9,5 @@ dist/
 eval/verify_progress.json
 eval/spot.txt
 eval/bench_out/
+
+.claude/

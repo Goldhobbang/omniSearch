@@ -25,7 +25,7 @@ import time
 import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from concurrent.futures import TimeoutError as FutureTimeout
 
 import requests
@@ -34,7 +34,7 @@ try:
 except ImportError:
     from duckduckgo_search import DDGS
 
-TOOL_VERSION = 8
+TOOL_VERSION = 9
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DB = os.environ.get("OMNI_CACHE") or os.path.join(
     os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME")
@@ -51,10 +51,11 @@ def _ttl_for(key):
         prefix = (key or "").split(":")[1]
     except Exception:
         return CACHE_TTL
-    if prefix in ("searxng", "ddg", "ddgn", "gdelt"):
+    if prefix in ("searxng", "ddg", "ddgn", "gdelt", "tav", "gnews",
+                  "bingweb", "bingnews", "gnewsrss"):
         return CACHE_TTL_SHORT
     if prefix in ("wiki", "openalex", "crossref", "wikidata", "arxiv",
-                  "you", "s2"):
+                  "you", "s2", "fetch"):
         return CACHE_TTL_LONG
     return CACHE_TTL
 UA = "omniSearch/0.2 (+https://github.com/Goldhobbang/omniSearch)"
@@ -80,16 +81,18 @@ TECH_HINTS = ("양자", "초전도", "데이터베이스", "학습", "칩", "프
               "아키텍처", "알고리즘", "네트워크", "반도체", "protein", "quantum")
 
 CHAIN = {
-    "기관명": ["wikipedia", "searxng", "wikidata", "duckduckgo", "you_search"],
-    "기술용어": ["wikipedia", "searxng", "duckduckgo", "you_search"],
-    "entity": ["wikipedia", "searxng", "wikidata", "duckduckgo", "you_search"],
-    "general": ["wikipedia", "searxng", "duckduckgo", "you_search"],
-    "한국어 신조어": ["searxng", "wikipedia", "duckduckgo", "you_search"],
-    "논문 제목": ["openalex", "crossref", "arxiv", "wikipedia", "searxng",
+    "기관명": ["wikipedia", "bing_web", "wikidata", "tavily", "duckduckgo", "you_search"],
+    "기술용어": ["wikipedia", "bing_web", "tavily", "duckduckgo", "you_search"],
+    "entity": ["wikipedia", "bing_web", "wikidata", "tavily", "duckduckgo", "you_search"],
+    "general": ["wikipedia", "bing_web", "tavily", "duckduckgo", "you_search"],
+    "한국어 신조어": ["bing_define", "bing_news", "google_news", "wikipedia", "tavily",
+                 "duckduckgo", "you_search"],
+    "논문 제목": ["openalex", "crossref", "arxiv", "wikipedia", "bing_web",
               "duckduckgo", "you_search"],
-    "최신 AI뉴스나 논란": ["searxng_news", "wikipedia", "duckduckgo_news",
-                        "you_search"],
+    "최신 AI뉴스나 논란": ["bing_news", "google_news", "gnews", "wikipedia",
+                        "duckduckgo_news", "tavily", "you_search"],
 }
+# searxng / searxng_news: 로컬 서버(WSL/Linux) 필요 -> 기본 체인에서 제외, OMNI_EXTRA=searxng 로 opt-in.
 # gdelt / semantic_scholar: 키 없는 공유 한도라 실측 429 대부분 -> extra= 로만 사용.
 # marginalia는 기본 체인에서 제외 (공유키 429 상시 + 범용품질 낮음).
 # 영어 롱테일/인디웹 전용 opt-in: extra=["marginalia"] 또는 OMNI_EXTRA 환경변수.
@@ -103,6 +106,32 @@ def _with_extra(chain, extra):
         if e in ENGINES and e not in out:
             out.append(e)
     return out
+
+
+def _code_token(q):
+    """코드 식별자형 쿼리 (venv, optimizer, DataLoader): 3~30자 ASCII 토큰 1개."""
+    return re.fullmatch(r"[A-Za-z][A-Za-z0-9_+#.\-]{2,29}", q or "") is not None \
+        and not has_hangul(q or "")
+
+
+def _model_token(q):
+    """모델명형 쿼리 (30B, Qwen3-30B): 숫자 포함 ASCII 토큰 1개."""
+    return re.fullmatch(r"[A-Za-z0-9_+#.\-]{2,31}", q or "") is not None \
+        and re.search(r"\d", q or "") is not None and not has_hangul(q or "")
+
+
+def _build_chain(cat, q, extra):
+    """카테고리 체인 + 쿼리형 게이트. 모델명은 HF를 맨 앞에(위키 동음이의가
+    끊기 전에), 코드 식별자는 SE를 searxng 다음 폴백으로."""
+    chain = _with_extra(CHAIN.get(cat, CHAIN["general"]), extra)
+    if _model_token(q):
+        if "huggingface" in ENGINES and "huggingface" not in chain:
+            chain.insert(0, "huggingface")
+    elif _code_token(q):
+        if "stackexchange" in ENGINES and "stackexchange" not in chain:
+            i = chain.index("bing_web") + 1 if "bing_web" in chain else len(chain)
+            chain.insert(i, "stackexchange")
+    return chain
 
 
 class ToolUnavailable(Exception):
@@ -133,6 +162,57 @@ def cache_put(key, val):
         con = _db()
         con.execute("INSERT OR REPLACE INTO c VALUES (?,?,?)",
                     (key, json.dumps(val, ensure_ascii=False), time.time()))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+
+# ---------------- quota ----------------
+# 유료급 무료키 엔진(Tavily 월 1000, GNews 일 100)의 기간 한도 관리.
+# 키 없으면 호출자가 네트워크 전에 스킵하므로 여기선 숫자만 센다.
+def _quota_period(kind):
+    return time.strftime("%Y-%m", time.gmtime()) if kind == "month" \
+        else time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def quota_check(engine, limit, kind):
+    try:
+        con = _db()
+        con.execute("CREATE TABLE IF NOT EXISTS q(e TEXT, p TEXT, n INT, "
+                    "PRIMARY KEY(e, p))")
+        row = con.execute("SELECT n FROM q WHERE e=? AND p=?",
+                          (engine, _quota_period(kind))).fetchone()
+        con.close()
+        return (row[0] if row else 0) < limit
+    except Exception:
+        return True  # DB 고장時は 쿼터 무시 (검색 우선)
+
+
+def quota_hit(engine, kind):
+    try:
+        con = _db()
+        con.execute("CREATE TABLE IF NOT EXISTS q(e TEXT, p TEXT, n INT, "
+                    "PRIMARY KEY(e, p))")
+        p = _quota_period(kind)
+        row = con.execute("SELECT n FROM q WHERE e=? AND p=?",
+                          (engine, p)).fetchone()
+        con.execute("INSERT OR REPLACE INTO q VALUES (?,?,?)",
+                    (engine, p, (row[0] if row else 0) + 1))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+
+def quota_spend_all(engine, limit, kind):
+    """서버가 한도 소진을 알리면(402/403) 남은 기간 네트워크 없이 스킵."""
+    try:
+        con = _db()
+        con.execute("CREATE TABLE IF NOT EXISTS q(e TEXT, p TEXT, n INT, "
+                    "PRIMARY KEY(e, p))")
+        con.execute("INSERT OR REPLACE INTO q VALUES (?,?,?)",
+                    (engine, _quota_period(kind), limit))
         con.commit()
         con.close()
     except Exception:
@@ -858,6 +938,322 @@ def you_search(query, max_results=5):
     return out
 
 
+def _parse_tavily(data, max_results):
+    out = []
+    for x in (data.get("results") or [])[:max_results]:
+        if not isinstance(x, dict):
+            continue
+        out.append({"title": x.get("title", "") or "",
+                    "url": x.get("url", "") or "",
+                    "snippet": x.get("content", "") or x.get("snippet", "") or ""})
+    return [x for x in out if norm(x.get("title"))]
+
+
+def tavily_search(query, max_results=5):
+    """Tavily AI search (LLM용 ranked 결과). 키 없으면 keyless 모드(무키·서버
+    한도), 있으면 TAVILY_API_KEY (월 1000크레딧 무료, basic=1). 폴백 전용 LAZY."""
+    key = f"v{TOOL_VERSION}:tav:{query}:{max_results}"
+    c = cache_get(key)
+    if c is not None:
+        return c
+    api_key = os.environ.get("TAVILY_API_KEY")
+    limit = int(os.environ.get("TAVILY_MONTHLY", "1000"))
+    if api_key and not quota_check("tavily", limit, "month"):
+        raise ToolUnavailable("tavily: monthly quota spent")
+    _check_cool("tavily")
+    _polite("tavily", 1.0)
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    else:
+        headers["X-Tavily-Access-Mode"] = "keyless"
+    try:
+        r = _session.post("https://api.tavily.com/search", headers=headers, json={
+            "query": query, "search_depth": "basic", "max_results": max_results,
+            "include_answer": False}, timeout=15)
+    except requests.RequestException as e:
+        raise ToolUnavailable(f"tavily: net {e}")
+    if r.status_code in (429, 402, 403):
+        if api_key and r.status_code in (402, 403):
+            quota_spend_all("tavily", limit, "month")
+        _cool("tavily")
+        raise ToolUnavailable(f"tavily: http {r.status_code} (quota?)")
+    try:
+        r.raise_for_status()
+    except requests.RequestException as e:
+        raise ToolUnavailable(f"tavily: {e}")
+    try:
+        out = _parse_tavily(r.json(), max_results)
+    except ValueError:
+        raise ToolUnavailable("tavily: bad json")
+    if api_key:
+        quota_hit("tavily", "month")
+    _ok("tavily")
+    cache_put(key, out)
+    return out
+
+
+def _parse_gnews(data, max_results):
+    out = []
+    for x in (data.get("articles") or [])[:max_results]:
+        if not isinstance(x, dict):
+            continue
+        src = x.get("source") or {}
+        name = src.get("name", "") if isinstance(src, dict) else ""
+        desc = x.get("description", "") or x.get("content", "") or ""
+        out.append({"title": x.get("title", "") or "",
+                    "url": x.get("url", "") or "",
+                    "snippet": (desc + (f" · {name}" if name else ""))[:300]})
+    return [x for x in out if norm(x.get("title"))]
+
+
+def gnews_search(query, max_results=8):
+    """GNews 뉴스 API. GNEWS_API_KEY 필수 (무료 100건/일, 카드 불필요,
+    12시간 지연). 키 없으면 네트워크 없이 즉시 스킵. 폴백 전용 LAZY."""
+    key = f"v{TOOL_VERSION}:gnews:{query}:{max_results}"
+    c = cache_get(key)
+    if c is not None:
+        return c
+    api_key = os.environ.get("GNEWS_API_KEY")
+    if not api_key:
+        raise ToolUnavailable("gnews: no API key")
+    limit = int(os.environ.get("GNEWS_DAILY", "100"))
+    if not quota_check("gnews", limit, "day"):
+        raise ToolUnavailable("gnews: daily quota spent")
+    _check_cool("gnews")
+    _polite("gnews", 1.0)
+    params = {"q": query, "max": min(max_results, 10), "apikey": api_key,
+              "lang": "ko" if has_hangul(query) else "en"}
+    if has_hangul(query):
+        params["country"] = "kr"
+    try:
+        r = _session.get("https://gnews.io/api/v4/search", params=params,
+                         timeout=15)
+    except requests.RequestException as e:
+        raise ToolUnavailable(f"gnews: net {e}")
+    if r.status_code == 403:
+        quota_spend_all("gnews", limit, "day")
+        _cool("gnews")
+        raise ToolUnavailable("gnews: daily quota spent (403)")
+    if r.status_code == 429:
+        _cool("gnews")
+        raise ToolUnavailable("gnews: 429 (cooldown)")
+    try:
+        r.raise_for_status()
+    except requests.RequestException as e:
+        raise ToolUnavailable(f"gnews: {e}")
+    try:
+        out = _parse_gnews(r.json(), max_results)
+    except ValueError:
+        raise ToolUnavailable("gnews: bad json")
+    quota_hit("gnews", "day")
+    _ok("gnews")
+    cache_put(key, out)
+    return out
+
+
+def _parse_stackexchange(data, max_results):
+    out = []
+    for x in (data.get("items") or [])[:max_results]:
+        if not isinstance(x, dict):
+            continue
+        tags = " ".join(f"[{t}]" for t in (x.get("tags") or [])[:3])
+        mark = " · 채택됨" if x.get("is_answered") else ""
+        out.append({"title": html.unescape(x.get("title", "") or ""),
+                    "url": x.get("link", "") or "",
+                    "snippet": f"▲{x.get('score', 0)} · 답변{x.get('answer_count', 0)}"
+                               f"{mark} {tags}".strip()})
+    return [x for x in out if norm(x.get("title"))]
+
+
+def stackexchange_search(query, max_results=8):
+    """Stack Overflow 검색 API. 무키 300건/일·IP. 코드 식별자 쿼리 전용.
+    quota_remaining==0이면 당일 스킵."""
+    key = f"v{TOOL_VERSION}:se:{query}:{max_results}"
+    c = cache_get(key)
+    if c is not None:
+        return c
+    limit = int(os.environ.get("SE_DAILY", "300"))
+    if not quota_check("stackexchange", limit, "day"):
+        raise ToolUnavailable("stackexchange: daily quota spent")
+    data = _get_json("https://api.stackexchange.com/2.3/search/advanced", {
+        "order": "desc", "sort": "relevance", "q": query,
+        "site": "stackoverflow", "pagesize": min(max_results, 10),
+    }, 15, "stackexchange", min_interval=1.0)
+    if data.get("quota_remaining") == 0:
+        quota_spend_all("stackexchange", limit, "day")
+        raise ToolUnavailable("stackexchange: daily quota spent (server)")
+    if "backoff" in data:
+        _cool("stackexchange", min(int(data["backoff"]), 120))
+        raise ToolUnavailable("stackexchange: backoff (cooldown)")
+    out = _parse_stackexchange(data, max_results)
+    cache_put(key, out)
+    return out
+
+
+def _parse_huggingface(data, max_results):
+    out = []
+    items = data if isinstance(data, list) else []
+    for x in items[:max_results]:
+        if not isinstance(x, dict) or not x.get("id"):
+            continue
+        meta = f"downloads {x.get('downloads', 0)} · likes {x.get('likes', 0)}"
+        if x.get("pipeline_tag"):
+            meta += f" · {x['pipeline_tag']}"
+        out.append({"title": x.get("id", ""),
+                    "url": "https://huggingface.co/" + x.get("id", ""),
+                    "snippet": meta})
+    return out
+
+
+def huggingface_search(query, max_results=8):
+    """HuggingFace Hub 모델 검색. 무키 허용(엄격 한도). 모델명 쿼리 전용."""
+    key = f"v{TOOL_VERSION}:hf:{query}:{max_results}"
+    c = cache_get(key)
+    if c is not None:
+        return c
+    data = _get_json("https://huggingface.co/api/models", {
+        "search": query, "limit": min(max_results, 10),
+        "sort": "downloads", "direction": "-1",
+    }, 15, "huggingface", min_interval=1.0)
+    out = _parse_huggingface(data, max_results)
+    cache_put(key, out)
+    return out
+
+
+def jina_fetch(url, max_chars=4000):
+    """r.jina.ai 본문 추출. 무키 20RPM (JINA_API_KEY 있으면 500RPM).
+    30일 캐시. 실패시 '' (호출자가 try로 감쌈)."""
+    if not url or not str(url).startswith("http"):
+        return ""
+    key = f"v{TOOL_VERSION}:fetch:{url}"
+    c = cache_get(key)
+    if c is not None:
+        return c
+    _check_cool("jina")
+    _polite("jina", 3.2)
+    jkey = os.environ.get("JINA_API_KEY")
+    try:
+        r = _session.get("https://r.jina.ai/" + url,
+                         headers=({"Authorization": f"Bearer {jkey}"}
+                                  if jkey else None),
+                         timeout=(3, 8))
+        if r.status_code in (429, 402, 403):
+            _cool("jina")
+            return ""
+        r.raise_for_status()
+        text = r.text[:max_chars]
+        try:  # JSON envelope ({"data": {"content": ...}}) 이면 본문만
+            body = json.loads(text)
+            text = (body.get("data") or {}).get("content") or text
+            text = text[:max_chars]
+        except ValueError:
+            pass
+    except Exception:
+        return ""
+    cache_put(key, text)
+    return text
+
+
+# ---------------- RSS 소스 (키 불필요, 비공식) ----------------
+# Bing 웹/뉴스, Google 뉴스는 RSS 출력을 키 없이 제공한다. SearXNG가 하던 일
+# (신조어/한국어 일반 웹/뉴스)을 로컬 서버 없이 직접 호출로 대체. 문서화된 공식 API가
+# 아니므로 차단·형식 변경이 가능 -> 쿨다운/캐시/다중 소스로 흡수.
+_RSS_UA = "Mozilla/5.0 (compatible; omniSearch/0.2; +https://github.com/Goldhobbang/omniSearch)"
+
+
+def _unwrap_bing(url):
+    """Bing 뉴스 링크(apiclick.aspx?...&url=원문)는 url 파라미터가 원문 주소."""
+    try:
+        p = urllib.parse.urlsplit(url)
+        if p.netloc.endswith("bing.com") and "apiclick" in p.path:
+            real = urllib.parse.parse_qs(p.query).get("url")
+            if real and real[0].startswith("http"):
+                return real[0]
+    except ValueError:
+        pass
+    return url
+
+
+def _parse_rss(content, max_results):
+    root = ET.fromstring(content)
+    out = []
+    for it in root.iter("item"):
+        title = norm(html.unescape(it.findtext("title") or ""))
+        if not title:
+            continue
+        desc = norm(strip_tags(html.unescape(it.findtext("description") or "")))
+        src = norm(it.findtext("source") or "")
+        if len(desc) <= len(title) + len(src) + 8:  # Google 뉴스: 설명이 제목+매체 반복
+            desc = ""
+        out.append({"title": title, "url": _unwrap_bing((it.findtext("link") or "").strip()),
+                    "snippet": (f"{src} · " if src else "") + desc[:200]})
+        if len(out) >= max_results:
+            break
+    return out
+
+
+def _rss_search(label, prefix, url, params, query, max_results):
+    # Accept-Language가 setmkt/hl과 어긋나면 Bing이 빈 피드를 돌려준다 -> 질의 언어로 통일.
+    lang = "ko-KR,ko;q=0.9,en;q=0.5" if has_hangul(query) else "en-US,en;q=0.9"
+    key = f"v{TOOL_VERSION}:{prefix}:{query}:{max_results}"
+    c = cache_get(key)
+    if c is not None:
+        return c
+    _check_cool(label)
+    _polite(label, 0.5)
+    try:
+        r = _session.get(url, params=params, timeout=(3, 10), headers={
+            "User-Agent": _RSS_UA, "Accept": "application/rss+xml, application/xml, */*",
+            "Accept-Language": lang})
+    except requests.RequestException as e:
+        raise ToolUnavailable(f"{label}: net {str(e)[:60]}")
+    if r.status_code in (403, 429, 503):
+        _cool(label)
+        raise ToolUnavailable(f"{label}: http {r.status_code} (cooldown)")
+    try:
+        r.raise_for_status()
+        out = _parse_rss(r.content, max_results)
+    except (requests.RequestException, ET.ParseError) as e:
+        raise ToolUnavailable(f"{label}: {str(e)[:80]}")
+    if out:  # 빈 결과(차단 페이지 등)는 캐시/성공 처리 안 함
+        _ok(label)
+        cache_put(key, out)
+    return out
+
+
+def _bing_params(query):
+    # 실측: 영어 질의에 setmkt=en-US를 주면 무관한 결과(요리/날씨/광고)가 나온다.
+    # 마켓은 한국어에만 지정하고 영어는 생략.
+    p = {"q": query, "format": "rss"}
+    if has_hangul(query):
+        p["setmkt"] = "ko-KR"
+    return p
+
+
+def bing_web_search(query, max_results=8):
+    return _rss_search("bing_web", "bingweb", "https://www.bing.com/search",
+                       _bing_params(query), query, max_results)
+
+
+def bing_define_search(query, max_results=8):
+    """신조어 뜻풀이: Bing 웹에 '<질의> 뜻'을 던진다. 실측 8개 중 5개가 나무위키/신조어사전
+    뜻풀이 페이지, 나머지 3개는 무관 결과(어휘 점수 0 -> 채택 안 됨)."""
+    return bing_web_search(f"{query} 뜻", max_results)
+
+
+def bing_news_search(query, max_results=8):
+    return _rss_search("bing_news", "bingnews", "https://www.bing.com/news/search",
+                       _bing_params(query), query, max_results)
+
+
+def google_news_search(query, max_results=8):
+    ko = has_hangul(query)
+    return _rss_search("google_news", "gnewsrss", "https://news.google.com/rss/search", {
+        "q": query, "hl": "ko" if ko else "en-US", "gl": "KR" if ko else "US",
+        "ceid": "KR:ko" if ko else "US:en"}, query, max_results)
+
+
 ENGINES = {
     "wikipedia": wiki_search,
     "openalex": openalex_search,
@@ -872,6 +1268,14 @@ ENGINES = {
     "arxiv": arxiv_search,
     "crossref": crossref_search,
     "wikidata": wikidata_search,
+    "tavily": tavily_search,
+    "gnews": gnews_search,
+    "stackexchange": stackexchange_search,
+    "huggingface": huggingface_search,
+    "bing_web": bing_web_search,
+    "bing_define": bing_define_search,
+    "bing_news": bing_news_search,
+    "google_news": google_news_search,
 }
 
 
@@ -933,26 +1337,93 @@ TOOL_LABELS = {
     "arxiv": "arXiv 논문 (키 불필요)",
     "crossref": "Crossref 논문 (키 불필요)",
     "wikidata": "Wikidata 개체 (키 불필요)",
+    "tavily": "Tavily AI 검색 (keyless/무료키)",
+    "gnews": "GNews 뉴스 (무료키 100/일)",
+    "stackexchange": "Stack Overflow (무키 300/일)",
+    "huggingface": "HuggingFace 모델 (무키)",
+    "bing_web": "Bing 웹 RSS (키 불필요)",
+    "bing_define": "Bing 웹 RSS '뜻' 질의 (키 불필요)",
+    "bing_news": "Bing 뉴스 RSS (키 불필요)",
+    "google_news": "Google 뉴스 RSS (키 불필요)",
 }
 
 
 # search()에서 차례가 와야 호출: you_search는 일일 한도, ddg는 차단이 잦은 예비 엔진.
 # arxiv는 규칙상 3초 간격이라 deadline을 갉아먹으므로 차례 호출로 강등
 # (OpenAlex+Crossref가 논문의 95%를 커버).
-LAZY_ENGINES = {"you_search", "duckduckgo", "duckduckgo_news", "arxiv"}
+LAZY_ENGINES = {"you_search", "duckduckgo", "duckduckgo_news", "arxiv",
+                "tavily", "gnews", "stackexchange", "huggingface"}
 
 
 # Tier별 1차 대기 상한: 공식API 1.5s 안에 못 오면 일단 건너뛰고, searxng는
 # 3s까지. 1차 순회가 불발이면 전체 DEADLINE까지 늦은 엔진을 회수 (품질 보존).
 TIER_TIMEOUT = {"wikipedia": 1.5, "wikidata": 1.5, "openalex": 1.5,
-                "crossref": 1.5, "searxng": 3.0, "searxng_news": 3.0}
+                "crossref": 1.5, "searxng": 3.0, "searxng_news": 3.0,
+                "bing_web": 2.0, "bing_define": 2.0, "bing_news": 2.0,
+                "google_news": 3.0}
 
 
 # 도메인 전문용어(entity/기술용어)는 위키 일반의미가 문자열 매칭으로 고득점을
 # 받아 체인을 끊어버리는 문제를 피하려고 조기채택 임계를 상향: 임계 미만이면
 # searxng까지 보고 best를 선택한다 (예: DataLoader ETL 문서 0.75 -> PyTorch
 # 튜토리얼 1.0으로 교정). 그 외 카테고리는 0.6 유지 (지연 우선).
-STOP_SCORE = {"기술용어": 0.8, "entity": 0.8}
+# 뉴스 RSS는 제목 어휘가 질의와 다르게 쓰이는 게 정상(예: 티몬 -> 티메프)이라
+# 어휘 점수가 0.4~0.6에 몰린다 (실측: 제목을 읽으면 전부 관련 기사). 0.6을 요구하면
+# 느린 예비 엔진을 DEADLINE까지 기다리게 되므로 뉴스는 0.45에서 채택.
+STOP_SCORE = {"기술용어": 0.8, "entity": 0.8, "최신 AI뉴스나 논란": 0.45}
+
+
+def _url_key(u):
+    try:
+        p = urllib.parse.urlsplit(u or "")
+    except ValueError:
+        return ""
+    host = p.netloc.lower().removeprefix("www.")
+    if not host or host == "news.google.com":  # 중계 URL은 키로 부적합 -> 제목 키만
+        return ""
+    return host + p.path.rstrip("/")
+
+
+def _title_key(t):
+    t = re.sub(r"\s[-–|]\s[^-–|]{1,30}$", "", norm(t))  # " - 매체명" 꼬리 제거
+    return compact(t)[:60]
+
+
+def fuse(packs, k=60, limit=10):
+    """가중 RRF. packs = {engine: (items, relevance)}. 엔진 관련도가 가중치라
+    정확히 맞춘 엔진의 순위가 더 크게 반영되고, 여러 엔진이 공통으로 올린 문서
+    (URL 표준화 + 제목 유사 중복 병합)가 위로 올라온다. 항목에 sources 부여."""
+    ents, idx = [], {}
+    for tool, (items, sc) in packs.items():
+        w = max(sc, 0.1)
+        for rank, it in enumerate(items):
+            keys = [x for x in (_url_key(it.get("url")), _title_key(it.get("title"))) if x]
+            e = next((idx[x] for x in keys if x in idx), None)
+            if e is None:
+                e = {"item": dict(it), "score": 0.0, "sources": []}
+                ents.append(e)
+            e["score"] += w / (k + rank + 1)
+            if tool not in e["sources"]:
+                e["sources"].append(tool)
+            if len(it.get("snippet") or "") > len(e["item"].get("snippet") or ""):
+                e["item"]["snippet"] = it["snippet"]
+            for x in keys:
+                idx.setdefault(x, e)
+    ents.sort(key=lambda e: e["score"], reverse=True)
+    return [{**e["item"], "sources": e["sources"]} for e in ents[:limit]]
+
+
+FUSE_MIN = 0.4  # 이 미만 관련도 엔진은 융합에서 제외 (잡음 유입 방지)
+
+
+FUSE_REL = 0.7  # 최고 엔진 점수의 70% 미만은 제외 (예: 1.0이 있으면 0.5 엔진의 잡음 차단)
+
+
+def _fusable(q, got):
+    ok = {t: (items, sc) for t, (items, sc) in got.items()
+          if items and sc >= FUSE_MIN and not looks_junk(q, items)}
+    top = max((sc for _, sc in ok.values()), default=0.0)
+    return {t: v for t, v in ok.items() if v[1] >= FUSE_REL * top}
 
 
 def _run_one(tool, q):
@@ -983,7 +1454,7 @@ def multi_search(query, curated=None, extra=None):
     try:
         route = classify(q, curated)
         cat = route["category"]
-        chain = _with_extra(CHAIN.get(cat, CHAIN["general"]), extra)
+        chain = _build_chain(cat, q, extra)
         ex = ThreadPoolExecutor(max_workers=len(chain))
         futs = {t: ex.submit(_run_one, t, q) for t in chain}
         wait(futs.values(), timeout=DEADLINE)
@@ -994,9 +1465,11 @@ def multi_search(query, curated=None, extra=None):
                 "label": TOOL_LABELS.get(t, t), "items": [], "score": 0.0,
                 "status": "timeout", "detail": f">{DEADLINE}s"}
         ordered = sorted(tools, key=lambda t: tools[t]["score"], reverse=True)
+        fused = fuse(_fusable(q, {t: (p["items"], p["score"]) for t, p in tools.items()
+                                  if p["status"] == "ok"}))
         return {"query": q, "category": cat, "lang": detect_lang(q),
                 "method": route["method"], "reason": route["reason"],
-                "chain": chain, "order": ordered, "tools": tools,
+                "chain": chain, "order": ordered, "tools": tools, "fused": fused,
                 "elapsed": round(time.time() - t0, 1)}
     except Exception as e:
         return {"query": q if isinstance(q, str) else str(query),
@@ -1014,70 +1487,84 @@ def search(query, curated=None, extra=None):
     try:
         route = classify(q, curated)
         cat = route["category"]
-        chain = _with_extra(CHAIN.get(cat, CHAIN["general"]), extra)
+        chain = _build_chain(cat, q, extra)
         lang = detect_lang(q)
         tried = {}
         best = None
-        # 체인 전 엔진 동시 시작, 우선순위 순으로 결과 확인 -> 지연 = 첫 합격 엔진까지.
-        # Tier 타임아웃: 빠른 엔진이 늦으면 일단 건너뛰고, 1차 불발시에만
-        # 전체 DEADLINE까지 회수 (2차). 일일 한도 엔진(LAZY)은 차례가 왔을 때만 호출.
+        got = {}  # 완료된 엔진 결과 {tool: (items, score)} -> 융합 입력
+        # 1차: 비-LAZY 엔진 동시 시작, 우선순위 순으로 확인 (Tier 타임아웃 초과분은 보류).
+        # 2차(1차 불발시만): LAZY 예비 엔진을 시작하고 보류분과 함께 완료 순서로 평가.
         ex = ThreadPoolExecutor(max_workers=len(chain))
         call = lambda t: [x for x in ENGINES[t](q) if norm(x.get("title"))]
-        futs = {t: ex.submit(call, t) for t in chain if t not in LAZY_ENGINES}
+        primary = [t for t in chain if t not in LAZY_ENGINES]
+        fallback = [t for t in chain if t in LAZY_ENGINES]
+        futs = {t: ex.submit(call, t) for t in primary}
         end = time.time() + DEADLINE
-        pending = []
-        for i, tool in enumerate(chain):
-            if tool not in futs:  # 예비 엔진 차례 = 앞 엔진 전부 불합격 -> 남은 예비 동시 시작
-                for t in chain[i:]:
-                    futs.setdefault(t, ex.submit(call, t))
-            fu = futs[tool]
+        stop_at = STOP_SCORE.get(cat, 0.6)
+
+        def evaluate(tool, fu, timeout):
+            """엔진 결과 1개 평가. 합격(조기종료 임계 이상)이면 True."""
+            nonlocal best
             try:
-                items = fu.result(timeout=max(
-                    0.1, min(TIER_TIMEOUT.get(tool, DEADLINE),
-                             end - time.time())))
+                items = fu.result(timeout=timeout)
             except FutureTimeout:
                 tried[tool] = {"status": "timeout", "detail": f">{DEADLINE}s"}
+                return None
+            except ToolUnavailable as e:
+                tried[tool] = {"status": "unavailable", "detail": str(e)[:120]}
+                return False
+            except Exception as e:
+                tried[tool] = {"status": "error", "detail": str(e)[:120]}
+                return False
+            sc = relevance(q, items)
+            tried[tool] = {"status": "ok", "n": len(items), "score": sc}
+            got[tool] = (items, sc)
+            if best is None or (sc, len(items)) > (best[0], best[1]):
+                best = (sc, len(items), tool, items)
+            return sc >= stop_at and bool(items)
+
+        # 1차: 우선순위 순. Tier 타임아웃 초과 엔진은 일단 건너뛰고 pending에 보관.
+        pending, stopped = [], False
+        for tool in primary:
+            r = evaluate(tool, futs[tool], max(
+                0.1, min(TIER_TIMEOUT.get(tool, DEADLINE), end - time.time())))
+            if r is None:
                 pending.append(tool)
-                continue
-            except ToolUnavailable as e:
-                tried[tool] = {"status": "unavailable", "detail": str(e)[:120]}
-                continue
-            except Exception as e:
-                tried[tool] = {"status": "error", "detail": str(e)[:120]}
-                continue
-            sc = relevance(q, items)
-            tried[tool] = {"status": "ok", "n": len(items), "score": sc}
-            cand = (sc, len(items), tool, items)
-            if best is None or (sc, len(items)) > (best[0], best[1]):
-                best = cand
-            if sc >= STOP_SCORE.get(cat, 0.6) and items:
-                pending = []
+            elif r:
+                stopped = True
                 break
-        for tool in pending:  # 2차: 1차 불발시에만 늦은 엔진 회수
-            try:
-                items = futs[tool].result(timeout=max(0.1, end - time.time()))
-            except FutureTimeout as e:
-                tried[tool] = {"status": "timeout", "detail": str(e)[:60]}
-                continue
-            except ToolUnavailable as e:
-                tried[tool] = {"status": "unavailable", "detail": str(e)[:120]}
-                continue
-            except Exception as e:
-                tried[tool] = {"status": "error", "detail": str(e)[:120]}
-                continue
-            sc = relevance(q, items)
-            tried[tool] = {"status": "ok", "n": len(items), "score": sc}
-            cand = (sc, len(items), tool, items)
-            if best is None or (sc, len(items)) > (best[0], best[1]):
-                best = cand
+        # 2차: 1차 불발시에만. 예비 엔진(일일 한도/차단 잦음)을 이때 한꺼번에 시작하고,
+        # 늦은 1차 엔진과 함께 체인 순서가 아닌 "완료 순서"로 평가 -> 느린 예비 엔진이
+        # 먼저 끝난 합격 결과를 막지 않는다.
+        if not stopped:
+            for t in fallback:
+                futs[t] = ex.submit(call, t)
+            remaining = {futs[t]: t for t in pending + fallback}
+            while remaining and not stopped and time.time() < end:
+                done, _ = wait(remaining, timeout=max(0.1, end - time.time()),
+                               return_when=FIRST_COMPLETED)
+                if not done:
+                    break
+                for fu in done:
+                    stopped = bool(evaluate(remaining.pop(fu), fu, 0)) or stopped
+            for t in remaining.values():
+                tried[t] = {"status": "timeout", "detail": f">{DEADLINE}s"}
+        for t, fu in futs.items():  # 기다리지 않고, 이미 끝난 엔진만 융합에 추가
+            if t not in got and fu.done() and not fu.cancelled() and fu.exception() is None:
+                its = fu.result()
+                got[t] = (its, relevance(q, its))
         ex.shutdown(wait=False)
         if best and best[3]:
             _, _, tool, items = best
+            fused = fuse(_fusable(q, got))
             return {"query": q, "category": cat, "lang": lang,
                     "method": route["method"], "reason": route["reason"],
                     "chain": chain, "used_tool": tool,
                     "score": tried[tool]["score"], "count": len(items),
-                    "items": items[:10], "tried": tried,
+                    "items": fused or items[:10],
+                    "engines": sorted({e for it in fused for e in it["sources"]}) or [tool],
+                    "fused_score": relevance(q, fused) if fused else tried[tool]["score"],
+                    "tried": tried,
                     "elapsed": round(time.time() - t0, 1)}
         return {"query": q, "category": cat, "lang": lang,
                 "method": route.get("method", "?"), "chain": chain,

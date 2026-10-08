@@ -3,6 +3,7 @@
 
   python eval/bench.py run paced 0      # human pacing (10s between queries), query set 0
   python eval/bench.py run burst 1      # agent pacing (back-to-back), query set 1
+  python eval/bench.py run burst 0 my_queries.json   # custom set: [[ [query, intended], ... ]]
   python eval/bench.py report eval/bench_out/*.json
 
 Records every engine call, every _polite wait and every cooldown; report replays
@@ -49,7 +50,7 @@ def sim(run, by_q, D):
     return waited, best
 
 
-def run(mode, half):
+def run(mode, half, qfile=None):
     out = os.path.join(HERE, "bench_out", f"{mode}{half}_{time.strftime('%m%d_%H%M')}.json")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     os.environ["OMNI_CACHE"] = out + ".db"
@@ -112,7 +113,7 @@ def run(mode, half):
 
     c._cool = cool
 
-    queries = json.load(open(os.path.join(HERE, "bench_queries.json"), encoding="utf-8"))[half]
+    queries = json.load(open(qfile or os.path.join(HERE, "bench_queries.json"), encoding="utf-8"))[half]
     runs = []
     for i, (q, intended) in enumerate(queries):
         qs = time.time()
@@ -201,7 +202,7 @@ def report(paths):
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["run"]:
-        run(sys.argv[2], int(sys.argv[3]))
+        run(sys.argv[2], int(sys.argv[3]), sys.argv[4] if len(sys.argv) > 4 else None)
     elif sys.argv[1:2] == ["report"]:
         report(sys.argv[2:])
     else:

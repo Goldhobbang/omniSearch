@@ -3,13 +3,14 @@
   omnisearch "질의"                 best-pick 결과
   omnisearch "질의" --multi         엔진별 전체 결과
   omnisearch "질의" --json          JSON 출력
+  omnisearch "질의" --fetch         상위 1건 본문 발췌 추가 (Jina, 느림)
   omnisearch "질의" --extra marginalia
 """
 import argparse
 import json
 import sys
 
-from .core import multi_search, search
+from .core import jina_fetch, multi_search, search
 
 
 def _print_items(items, n):
@@ -29,11 +30,16 @@ def main(argv=None):
     p.add_argument("--extra", action="append", default=None,
                    help="opt-in engine (repeatable), e.g. marginalia")
     p.add_argument("-n", type=int, default=5, help="items to show per engine")
+    p.add_argument("--fetch", action="store_true",
+                   help="fetch top-1 page body excerpt (Jina, slow)")
     a = p.parse_args(argv)
 
     if hasattr(sys.stdout, "reconfigure"):  # Windows cp949 콘솔 대비
         sys.stdout.reconfigure(encoding="utf-8")
     r = (multi_search if a.multi else search)(a.query, extra=a.extra)
+    if a.fetch and not a.multi and r.get("items"):
+        top = r["items"][0]
+        top["extract"] = jina_fetch(top.get("url") or "")[:500]
     if a.json:
         print(json.dumps(r, ensure_ascii=False, indent=1))
         return 0 if not r.get("error") else 1

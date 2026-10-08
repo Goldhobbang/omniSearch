@@ -17,8 +17,9 @@ search:
     - json
 
 outgoing:
-  # 전역 업스트림 대기 상한 (기본 3.0s). omniSearch Tier2(3s)와 정합.
-  request_timeout: 2.0
+  # 전역 업스트림 대기 상한. 2.0으로 낮추면 빈 결과가 늘어나는 것이 실측되어
+  # 기본 3.0 유지 (영구 사망 엔진은 아래에서 비활성화).
+  request_timeout: 3.0
 
 engines:
   - name: naver

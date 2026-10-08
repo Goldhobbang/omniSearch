@@ -14,4 +14,8 @@ jobs:
       - run: pip install -e ".[web,mcp]"
       - run: python tests/test_junk.py
       - run: python tests/test_ratelimit.py
+      - run: python tests/test_quota.py
+      - run: python tests/test_sense.py
+      - run: python tests/test_fuse.py
+      - run: python tests/test_web.py
       - run: python -c "import omnisearch.web, omnisearch.mcp_server, omnisearch.cli"

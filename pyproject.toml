@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "omnisearch"
 dynamic = ["version"]
-description = "Keyless multi-engine search router (Wikipedia, OpenAlex, arXiv, SearXNG, DuckDuckGo, ...)"
+description = "Keyless hybrid search router: Wikipedia, OpenAlex/Crossref/arXiv, Bing & Google News feeds, DuckDuckGo, fused with weighted RRF"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -27,4 +27,4 @@ Repository = "https://github.com/Goldhobbang/omniSearch"
 version = { attr = "omnisearch.__version__" }
 
 [tool.setuptools.package-data]
-omnisearch = ["searxng/*"]
+omnisearch = ["searxng/*", "static/*", "static/assets/*"]

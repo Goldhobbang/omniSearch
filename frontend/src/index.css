@@ -1,0 +1,200 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+/* 폰트: 라틴 서브셋 woff2만 번들한다. 한글은 시스템 폰트로 폴백(--font-* 참고). */
+@font-face {
+  font-family: "Instrument Sans";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("../node_modules/@fontsource/instrument-sans/files/instrument-sans-latin-400-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "Instrument Sans";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("../node_modules/@fontsource/instrument-sans/files/instrument-sans-latin-500-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "Instrument Sans";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("../node_modules/@fontsource/instrument-sans/files/instrument-sans-latin-600-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "Instrument Serif";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("../node_modules/@fontsource/instrument-serif/files/instrument-serif-latin-400-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "Instrument Serif";
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url("../node_modules/@fontsource/instrument-serif/files/instrument-serif-latin-400-italic.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "DM Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("../node_modules/@fontsource/dm-mono/files/dm-mono-latin-400-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "DM Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("../node_modules/@fontsource/dm-mono/files/dm-mono-latin-500-normal.woff2")
+    format("woff2");
+}
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-sans: "Instrument Sans", system-ui, -apple-system, "Segoe UI",
+    "Malgun Gothic", "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  --font-heading: var(--font-sans);
+  --font-display: "Instrument Serif", "Malgun Gothic", "Apple SD Gothic Neo",
+    "Noto Sans KR", serif;
+  --font-mono: "DM Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary-ink: var(--primary-ink);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/* 종이 + 먹 + 주홍(인주). 색은 전부 토큰으로만 쓴다. */
+:root {
+  color-scheme: light;
+  --background: oklch(0.968 0.01 84);
+  --foreground: oklch(0.215 0.022 55);
+  --card: oklch(0.985 0.007 84);
+  --card-foreground: oklch(0.215 0.022 55);
+  --popover: oklch(0.985 0.007 84);
+  --popover-foreground: oklch(0.215 0.022 55);
+  --primary: oklch(0.56 0.19 34);
+  --primary-foreground: oklch(0.985 0.008 84);
+  --primary-ink: oklch(0.5 0.19 34);
+  --secondary: oklch(0.935 0.014 82);
+  --secondary-foreground: oklch(0.28 0.022 55);
+  --muted: oklch(0.94 0.013 82);
+  --muted-foreground: oklch(0.485 0.022 65);
+  --accent: oklch(0.93 0.022 72);
+  --accent-foreground: oklch(0.25 0.022 55);
+  --destructive: oklch(0.54 0.22 27);
+  --border: oklch(0.885 0.015 80);
+  --input: oklch(0.855 0.018 80);
+  --ring: oklch(0.66 0.15 38);
+  --radius: 0.5rem;
+}
+
+.dark {
+  color-scheme: dark;
+  --background: oklch(0.165 0.012 52);
+  --foreground: oklch(0.95 0.01 84);
+  --card: oklch(0.2 0.014 52);
+  --card-foreground: oklch(0.95 0.01 84);
+  --popover: oklch(0.215 0.015 52);
+  --popover-foreground: oklch(0.95 0.01 84);
+  --primary: oklch(0.7 0.17 40);
+  --primary-foreground: oklch(0.16 0.02 50);
+  --primary-ink: oklch(0.78 0.15 40);
+  --secondary: oklch(0.27 0.015 52);
+  --secondary-foreground: oklch(0.95 0.01 84);
+  --muted: oklch(0.25 0.014 52);
+  --muted-foreground: oklch(0.72 0.02 75);
+  --accent: oklch(0.3 0.025 52);
+  --accent-foreground: oklch(0.95 0.01 84);
+  --destructive: oklch(0.7 0.19 25);
+  --border: oklch(0.95 0.01 84 / 11%);
+  --input: oklch(0.95 0.01 84 / 16%);
+  --ring: oklch(0.7 0.15 40 / 65%);
+}
+
+@utility eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  line-height: 1;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply font-sans;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    min-height: 100svh;
+    /* 한글은 어절 단위로만 줄바꿈, 긴 URL 등은 넘치면 강제 줄바꿈 */
+    word-break: keep-all;
+    overflow-wrap: break-word;
+  }
+  /* 배경: 위쪽에서 옅어지는 점격자 + 모서리 주홍 글로우 */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background:
+      radial-gradient(
+        50rem 26rem at 6% -6%,
+        color-mix(in oklch, var(--primary) 13%, transparent),
+        transparent 70%
+      ),
+      radial-gradient(
+          color-mix(in oklch, var(--foreground) 15%, transparent) 1px,
+          transparent 1.3px
+        )
+        0 0 / 22px 22px;
+    -webkit-mask-image: linear-gradient(to bottom, #000 0%, transparent 75%);
+    mask-image: linear-gradient(to bottom, #000 0%, transparent 75%);
+  }
+  ::selection {
+    background: color-mix(in oklch, var(--primary) 30%, transparent);
+  }
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+}
